@@ -1,5 +1,5 @@
 language: go
-go: 1.7.5
+go: "1.22"
 sudo: required
 env:
 - GROUP=weaveworksdemos COMMIT=$TRAVIS_COMMIT TAG=$TRAVIS_TAG
@@ -11,9 +11,9 @@ script:
 - make coverprofile
 - make dockertest
 install:
-- make deps
+- go mod download
 after_success:
-- go get -v github.com/mattn/goveralls
+- go install github.com/mattn/goveralls@latest
 - goveralls -coverprofile=cover.profile -service=travis-ci
 - make dockertravisbuild
 notifications:

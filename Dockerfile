@@ -12,17 +12,17 @@
 # ENTRYPOINT user
 # EXPOSE 8084
 
-FROM golang:1.7-alpine
+FROM golang:1.22-alpine
 
 COPY . /go/src/github.com/microservices-demo/user/
 WORKDIR /go/src/github.com/microservices-demo/user/
 
 RUN apk update
 RUN apk add git
-RUN go get -v github.com/Masterminds/glide 
-RUN glide install && CGO_ENABLED=0 go build -a -installsuffix cgo -o /user main.go
+RUN go mod download
+RUN CGO_ENABLED=0 go build -a -installsuffix cgo -o /user main.go
 
-FROM alpine:3.4
+FROM alpine:3.20
 
 ENV	SERVICE_USER=myuser \
 	SERVICE_UID=10001 \
@@ -34,9 +34,9 @@ RUN	addgroup -g ${SERVICE_GID} ${SERVICE_GROUP} && \
 	apk --no-cache add libcap
 
 
-ENV HATEAOS user
-ENV USER_DATABASE mongodb
-ENV MONGO_HOST user-db
+ENV HATEAOS=user
+ENV USER_DATABASE=mongodb
+ENV MONGO_HOST=user-db
 
 WORKDIR /
 EXPOSE 80

@@ -10,24 +10,21 @@ TAG=$(TRAVIS_COMMIT)
 default: docker
 
 
-pre: 
-	go get -v github.com/Masterminds/glide
-
-deps: pre
-	glide install
+deps:
+	go mod download
 
 rm-deps:
-	rm -rf vendor
+	go clean -modcache
 
 test:
 	@docker build -t $(INSTANCE)-test -f ./Dockerfile-test .
-	@docker run --rm -it $(INSTANCE)-test /bin/sh -c 'glide novendor| xargs go test -v'
+	@docker run --rm -it $(INSTANCE)-test /bin/sh -c 'go test -v ./...'
 
 cover:
-	@glide novendor|xargs go test -v -covermode=count
+	@go test -v -covermode=count ./...
 
 coverprofile:
-	go get github.com/modocache/gover
+	go install github.com/modocache/gover@latest
 	go test -v -covermode=count -coverprofile=profile.coverprofile
 	go test -v -covermode=count -coverprofile=db.coverprofile ./db
 	go test -v -covermode=count -coverprofile=mongo.coverprofile ./db/mongodb
