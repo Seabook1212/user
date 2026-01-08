@@ -9,7 +9,7 @@ func TestAddLinksCard(t *testing.T) {
 	domain = "mydomain"
 	c := Card{ID: "test"}
 	c.AddLinks()
-	h := Href{"http://mydomain/cards/test"}
+	h := Href{Href: "http://mydomain/cards/test"}
 	if !reflect.DeepEqual(c.Links["card"], h) {
 		t.Error("expected equal address links")
 	}

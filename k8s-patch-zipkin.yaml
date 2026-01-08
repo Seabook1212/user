@@ -1,0 +1,13 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user
+  namespace: sock-shop
+spec:
+  template:
+    spec:
+      containers:
+      - name: user
+        env:
+        - name: ZIPKIN
+          value: "http://jaeger-collector.observability.svc.cluster.local:9411/api/v2/spans"

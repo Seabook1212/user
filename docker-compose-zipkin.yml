@@ -10,7 +10,7 @@ services:
         read_only: true
         environment:
             - MONGO_HOST=user-db:27017
-            - ZIPKIN=http://zipkin:9411/api/v1/spans
+            - ZIPKIN=http://jaeger-collector.observability.svc.cluster.local:9411/api/v2/spans
             - reschedule=on-node-failure
         ports:
             - "8084:8084"

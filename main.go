@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	corelog "log"
 
@@ -20,6 +21,7 @@ import (
 	stdopentracing "github.com/opentracing/opentracing-go"
 	zipkinot "github.com/openzipkin-contrib/zipkin-go-opentracing"
 	"github.com/openzipkin/zipkin-go"
+	"github.com/openzipkin/zipkin-go/reporter"
 	zipkinhttp "github.com/openzipkin/zipkin-go/reporter/http"
 	stdprometheus "github.com/prometheus/client_golang/prometheus"
 	commonMiddleware "github.com/weaveworks/common/middleware"
@@ -94,27 +96,54 @@ func main() {
 	defer conn.Close()
 
 	var tracer stdopentracing.Tracer
+	var zipkinReporter reporter.Reporter
 	{
 		if zip == "" {
 			tracer = stdopentracing.NoopTracer{}
+			logger.Log("msg", "Tracing disabled - no Zipkin endpoint configured")
 		} else {
 			logger := log.With(logger, "tracer", "Zipkin")
 			logger.Log("addr", zip)
-			reporter := zipkinhttp.NewReporter(zip)
+
+			// Create a standard logger for Zipkin reporter errors
+			zipkinLogger := corelog.New(os.Stderr, "ZIPKIN: ", corelog.LstdFlags)
+
+			// Create reporter with batching for better performance
+			zipkinReporter = zipkinhttp.NewReporter(
+				zip,
+				zipkinhttp.BatchSize(100),
+				zipkinhttp.BatchInterval(1*time.Second),
+				zipkinhttp.Logger(zipkinLogger),
+			)
+
 			endpoint, err := zipkin.NewEndpoint(ServiceName, fmt.Sprintf("%v:%v", host, port))
 			if err != nil {
 				logger.Log("err", err)
 				os.Exit(1)
 			}
-			nativeTracer, err := zipkin.NewTracer(reporter, zipkin.WithLocalEndpoint(endpoint))
+
+			nativeTracer, err := zipkin.NewTracer(
+				zipkinReporter,
+				zipkin.WithLocalEndpoint(endpoint),
+				zipkin.WithSharedSpans(false),
+			)
 			if err != nil {
 				logger.Log("err", err)
 				os.Exit(1)
 			}
+
 			tracer = zipkinot.Wrap(nativeTracer)
+			logger.Log("msg", "Zipkin tracer initialized successfully")
 		}
 		stdopentracing.InitGlobalTracer(tracer)
 	}
+
+	// Ensure reporter is closed on shutdown to flush pending spans
+	defer func() {
+		if zipkinReporter != nil {
+			zipkinReporter.Close()
+		}
+	}()
 	dbconn := false
 	for !dbconn {
 		err := db.Init()

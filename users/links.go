@@ -24,8 +24,8 @@ type Links map[string]Href
 func (l *Links) AddLink(ent string, id string) {
 	nl := make(Links)
 	link := fmt.Sprintf("http://%v/%v/%v", domain, entitymap[ent], id)
-	nl[ent] = Href{link}
-	nl["self"] = Href{link}
+	nl[ent] = Href{Href: link}
+	nl["self"] = Href{Href: link}
 	*l = nl
 
 }
@@ -33,7 +33,7 @@ func (l *Links) AddLink(ent string, id string) {
 func (l *Links) AddAttrLink(attr string, corent string, id string) {
 	link := fmt.Sprintf("http://%v/%v/%v/%v", domain, entitymap[corent], id, entitymap[attr])
 	nl := *l
-	nl[entitymap[attr]] = Href{link}
+	nl[entitymap[attr]] = Href{Href: link}
 	*l = nl
 }
 
@@ -52,5 +52,5 @@ func (l *Links) AddCard(id string) {
 }
 
 type Href struct {
-	string `json:"href"`
+	Href string `json:"href"`
 }
