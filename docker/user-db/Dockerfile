@@ -15,3 +15,5 @@ RUN su - mongodb && mongod --fork --logpath /var/log/mongodb.log --dbpath /data/
 VOLUME /data/db-users
 
 CMD ["mongod", "--config", "/etc/mongodb.conf", "--smallfiles"]
+
+#Image:        weaveworksdemos/user-db:0.3.0
