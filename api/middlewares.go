@@ -149,13 +149,13 @@ func (mw loggingMiddleware) Delete(entity, id string) (err error) {
 }
 
 func (mw loggingMiddleware) Health() (health []Health) {
-	defer func(begin time.Time) {
-		mw.logger.Log(
-			"method", "Health",
-			"result", len(health),
-			"took", time.Since(begin),
-		)
-	}(time.Now())
+	// defer func(begin time.Time) {
+	// 	mw.logger.Log(
+	// 		"method", "Health",
+	// 		"result", len(health),
+	// 		"took", time.Since(begin),
+	// 	)
+	// }(time.Now())
 	return mw.next.Health()
 }
 
