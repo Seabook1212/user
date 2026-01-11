@@ -33,6 +33,12 @@ func MakeHTTPHandler(e Endpoints, logger log.Logger, tracer stdopentracing.Trace
 		httptransport.ServerBefore(opentracing.HTTPToContext(tracer, "http-request", logger)),
 	}
 
+	// Options for health/metrics endpoints without tracing
+	healthOptions := []httptransport.ServerOption{
+		httptransport.ServerErrorLogger(logger),
+		httptransport.ServerErrorEncoder(encodeError),
+	}
+
 	// GET /login       Login
 	// GET /register    Register
 	// GET /health      Health Check
@@ -95,7 +101,7 @@ func MakeHTTPHandler(e Endpoints, logger log.Logger, tracer stdopentracing.Trace
 		e.HealthEndpoint,
 		decodeHealthRequest,
 		encodeHealthResponse,
-		options...,
+		healthOptions...,
 	))
 	r.Handle("/metrics", promhttp.Handler())
 	return r

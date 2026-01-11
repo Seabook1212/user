@@ -34,7 +34,7 @@ func MakeEndpoints(s Service, tracer stdopentracing.Tracer) Endpoints {
 	return Endpoints{
 		LoginEndpoint:       opentracing.TraceServer(tracer, "GET /login")(MakeLoginEndpoint(s)),
 		RegisterEndpoint:    opentracing.TraceServer(tracer, "POST /register")(MakeRegisterEndpoint(s)),
-		HealthEndpoint:      opentracing.TraceServer(tracer, "GET /health")(MakeHealthEndpoint(s)),
+		HealthEndpoint:      MakeHealthEndpoint(s), // No tracing for health checks
 		UserGetEndpoint:     opentracing.TraceServer(tracer, "GET /customers")(MakeUserGetEndpoint(s)),
 		UserPostEndpoint:    opentracing.TraceServer(tracer, "POST /customers")(MakeUserPostEndpoint(s)),
 		AddressGetEndpoint:  opentracing.TraceServer(tracer, "GET /addresses")(MakeAddressGetEndpoint(s)),
@@ -210,10 +210,6 @@ func MakeDeleteEndpoint(s Service) endpoint.Endpoint {
 // MakeHealthEndpoint returns current health of the given service.
 func MakeHealthEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		var span stdopentracing.Span
-		span, ctx = stdopentracing.StartSpanFromContext(ctx, "health check")
-		span.SetTag("service", "user")
-		defer span.Finish()
 		health := s.Health()
 		return healthResponse{Health: health}, nil
 	}

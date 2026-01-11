@@ -125,7 +125,7 @@ func main() {
 			nativeTracer, err := zipkin.NewTracer(
 				zipkinReporter,
 				zipkin.WithLocalEndpoint(endpoint),
-				zipkin.WithSharedSpans(false),
+				zipkin.WithSharedSpans(true),
 			)
 			if err != nil {
 				logger.Log("err", err)
