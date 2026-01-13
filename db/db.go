@@ -1,11 +1,13 @@
 package db
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
 
+	"github.com/microservices-demo/user/db/mongodb"
 	"github.com/microservices-demo/user/users"
 )
 
@@ -69,6 +71,11 @@ func Set() error {
 //Register registers the database interface in the DBTypes
 func Register(name string, db Database) {
 	DBTypes[name] = db
+}
+
+//SetTraceContext sets the context for tracing database operations
+func SetTraceContext(ctx context.Context) {
+	mongodb.SetTraceContext(ctx)
 }
 
 //CreateUser invokes DefaultDb method

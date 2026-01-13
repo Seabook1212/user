@@ -162,7 +162,8 @@ func main() {
 	var service api.Service
 	{
 		service = api.NewFixedService()
-		service = api.LoggingMiddleware(logger)(service)
+		// Logging now done at endpoint level with trace information
+		// service = api.LoggingMiddleware(logger)(service)
 		service = api.NewInstrumentingService(
 			kitprometheus.NewCounterFrom(
 				stdprometheus.CounterOpts{
@@ -183,7 +184,7 @@ func main() {
 	}
 
 	// Endpoint domain.
-	endpoints := api.MakeEndpoints(service, tracer)
+	endpoints := api.MakeEndpoints(service, tracer, logger)
 
 	// HTTP router
 	router := api.MakeHTTPHandler(endpoints, logger, tracer)

@@ -6,12 +6,16 @@ package api
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/go-kit/kit/endpoint"
+	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/tracing/opentracing"
 	"github.com/microservices-demo/user/db"
 	"github.com/microservices-demo/user/users"
 	stdopentracing "github.com/opentracing/opentracing-go"
+	zipkinot "github.com/openzipkin-contrib/zipkin-go-opentracing"
 )
 
 // Endpoints collects the endpoints that comprise the Service.
@@ -30,28 +34,140 @@ type Endpoints struct {
 
 // MakeEndpoints returns an Endpoints structure, where each endpoint is
 // backed by the given service.
-func MakeEndpoints(s Service, tracer stdopentracing.Tracer) Endpoints {
-	return Endpoints{
-		LoginEndpoint:       opentracing.TraceServer(tracer, "GET /login")(MakeLoginEndpoint(s)),
-		RegisterEndpoint:    opentracing.TraceServer(tracer, "POST /register")(MakeRegisterEndpoint(s)),
-		HealthEndpoint:      MakeHealthEndpoint(s), // No tracing for health checks
-		UserGetEndpoint:     opentracing.TraceServer(tracer, "GET /customers")(MakeUserGetEndpoint(s)),
-		UserPostEndpoint:    opentracing.TraceServer(tracer, "POST /customers")(MakeUserPostEndpoint(s)),
-		AddressGetEndpoint:  opentracing.TraceServer(tracer, "GET /addresses")(MakeAddressGetEndpoint(s)),
-		AddressPostEndpoint: opentracing.TraceServer(tracer, "POST /addresses")(MakeAddressPostEndpoint(s)),
-		CardGetEndpoint:     opentracing.TraceServer(tracer, "GET /cards")(MakeCardGetEndpoint(s)),
-		DeleteEndpoint:      opentracing.TraceServer(tracer, "DELETE /")(MakeDeleteEndpoint(s)),
-		CardPostEndpoint:    opentracing.TraceServer(tracer, "POST /cards")(MakeCardPostEndpoint(s)),
+func MakeEndpoints(s Service, tracer stdopentracing.Tracer, logger log.Logger) Endpoints {
+	// Create logging middleware that extracts trace info
+	loggingMiddleware := func(method string) endpoint.Middleware {
+		return func(next endpoint.Endpoint) endpoint.Endpoint {
+			return func(ctx context.Context, request interface{}) (interface{}, error) {
+				begin := time.Now()
+				response, err := next(ctx, request)
+
+				// Extract trace information from context
+				span := stdopentracing.SpanFromContext(ctx)
+				traceid := ""
+				spanid := ""
+				if span != nil {
+					if sc, ok := span.Context().(zipkinot.SpanContext); ok {
+						// Format trace ID - use Low part for 64-bit trace IDs
+						traceid = fmt.Sprintf("%x", sc.TraceID.Low)
+						// Format span ID - this is the server span ID created by TraceServer
+						spanid = fmt.Sprintf("%x", uint64(sc.ID))
+					}
+				}
+
+				// Build log message
+				logArgs := []interface{}{
+					"traceid", traceid,
+					"spanid", spanid,
+					"method", method,
+				}
+
+				// Add request-specific fields based on method
+				logArgs = appendRequestFields(logArgs, method, request, response, err)
+
+				// Add error if present
+				if err != nil {
+					logArgs = append(logArgs, "err", err.Error())
+				} else {
+					logArgs = append(logArgs, "err", "null")
+				}
+
+				// Add duration
+				logArgs = append(logArgs, "took", fmt.Sprintf("%v", time.Since(begin)))
+
+				logger.Log(logArgs...)
+				return response, err
+			}
+		}
 	}
+
+	return Endpoints{
+		LoginEndpoint:       opentracing.TraceServer(tracer, "GET /login")(loggingMiddleware("Login")(MakeLoginEndpoint(s))),
+		RegisterEndpoint:    opentracing.TraceServer(tracer, "POST /register")(loggingMiddleware("Register")(MakeRegisterEndpoint(s))),
+		HealthEndpoint:      MakeHealthEndpoint(s), // No tracing for health checks
+		UserGetEndpoint:     opentracing.TraceServer(tracer, "GET /customers")(loggingMiddleware("GetUsers")(MakeUserGetEndpoint(s))),
+		UserPostEndpoint:    opentracing.TraceServer(tracer, "POST /customers")(loggingMiddleware("PostUser")(MakeUserPostEndpoint(s))),
+		AddressGetEndpoint:  opentracing.TraceServer(tracer, "GET /addresses")(loggingMiddleware("GetAddresses")(MakeAddressGetEndpoint(s))),
+		AddressPostEndpoint: opentracing.TraceServer(tracer, "POST /addresses")(loggingMiddleware("PostAddress")(MakeAddressPostEndpoint(s))),
+		CardGetEndpoint:     opentracing.TraceServer(tracer, "GET /cards")(loggingMiddleware("GetCards")(MakeCardGetEndpoint(s))),
+		DeleteEndpoint:      opentracing.TraceServer(tracer, "DELETE /")(loggingMiddleware("Delete")(MakeDeleteEndpoint(s))),
+		CardPostEndpoint:    opentracing.TraceServer(tracer, "POST /cards")(loggingMiddleware("PostCard")(MakeCardPostEndpoint(s))),
+	}
+}
+
+// appendRequestFields adds method-specific fields to log output
+func appendRequestFields(logArgs []interface{}, method string, request interface{}, response interface{}, err error) []interface{} {
+	switch method {
+	case "GetUsers":
+		req := request.(GetRequest)
+		id := req.ID
+		if id == "" {
+			id = "all"
+		}
+		logArgs = append(logArgs, "id", id)
+		if err == nil {
+			if usersResp, ok := response.(EmbedStruct); ok {
+				if ur, ok := usersResp.Embed.(usersResponse); ok {
+					logArgs = append(logArgs, "result", len(ur.Users))
+				}
+			} else if user, ok := response.(users.User); ok {
+				if user.UserID != "" {
+					logArgs = append(logArgs, "result", 1)
+				} else {
+					logArgs = append(logArgs, "result", 0)
+				}
+			}
+		}
+	case "GetAddresses":
+		req := request.(GetRequest)
+		id := req.ID
+		if id == "" {
+			id = "all"
+		}
+		logArgs = append(logArgs, "id", id)
+		if err == nil {
+			if addrsResp, ok := response.(EmbedStruct); ok {
+				if ar, ok := addrsResp.Embed.(addressesResponse); ok {
+					logArgs = append(logArgs, "result", len(ar.Addresses))
+				}
+			}
+		}
+	case "GetCards":
+		req := request.(GetRequest)
+		id := req.ID
+		if id == "" {
+			id = "all"
+		}
+		logArgs = append(logArgs, "id", id)
+		if err == nil {
+			if cardsResp, ok := response.(EmbedStruct); ok {
+				if cr, ok := cardsResp.Embed.(cardsResponse); ok {
+					logArgs = append(logArgs, "result", len(cr.Cards))
+				}
+			}
+		}
+	case "PostUser", "PostAddress", "PostCard", "Register":
+		if err == nil {
+			if pr, ok := response.(postResponse); ok {
+				logArgs = append(logArgs, "result", pr.ID)
+			}
+		}
+	case "Delete":
+		req := request.(deleteRequest)
+		logArgs = append(logArgs, "entity", req.Entity, "id", req.ID)
+		if err == nil {
+			if sr, ok := response.(statusResponse); ok {
+				logArgs = append(logArgs, "result", sr.Status)
+			}
+		}
+	}
+	return logArgs
 }
 
 // MakeLoginEndpoint returns an endpoint via the given service.
 func MakeLoginEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		var span stdopentracing.Span
-		span, ctx = stdopentracing.StartSpanFromContext(ctx, "login user")
-		span.SetTag("service", "user")
-		defer span.Finish()
+		db.SetTraceContext(ctx)
 		req := request.(loginRequest)
 		u, err := s.Login(req.Username, req.Password)
 		return userResponse{User: u}, err
@@ -61,10 +177,7 @@ func MakeLoginEndpoint(s Service) endpoint.Endpoint {
 // MakeRegisterEndpoint returns an endpoint via the given service.
 func MakeRegisterEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		var span stdopentracing.Span
-		span, ctx = stdopentracing.StartSpanFromContext(ctx, "register user")
-		span.SetTag("service", "user")
-		defer span.Finish()
+		db.SetTraceContext(ctx)
 		req := request.(registerRequest)
 		id, err := s.Register(req.Username, req.Password, req.Email, req.FirstName, req.LastName)
 		return postResponse{ID: id}, err
@@ -74,16 +187,10 @@ func MakeRegisterEndpoint(s Service) endpoint.Endpoint {
 // MakeUserGetEndpoint returns an endpoint via the given service.
 func MakeUserGetEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		var span stdopentracing.Span
-		span, ctx = stdopentracing.StartSpanFromContext(ctx, "get users")
-		span.SetTag("service", "user")
-		defer span.Finish()
-
+		db.SetTraceContext(ctx)
 		req := request.(GetRequest)
 
-		userspan := stdopentracing.StartSpan("users from db", stdopentracing.ChildOf(span.Context()))
 		usrs, err := s.GetUsers(req.ID)
-		userspan.Finish()
 		if req.ID == "" {
 			return EmbedStruct{usersResponse{Users: usrs}}, err
 		}
@@ -97,9 +204,7 @@ func MakeUserGetEndpoint(s Service) endpoint.Endpoint {
 			return users.User{}, err
 		}
 		user := usrs[0]
-		attrspan := stdopentracing.StartSpan("attributes from db", stdopentracing.ChildOf(span.Context()))
 		db.GetUserAttributes(&user)
-		attrspan.Finish()
 		if req.Attr == "addresses" {
 			return EmbedStruct{addressesResponse{Addresses: user.Addresses}}, err
 		}
@@ -113,10 +218,7 @@ func MakeUserGetEndpoint(s Service) endpoint.Endpoint {
 // MakeUserPostEndpoint returns an endpoint via the given service.
 func MakeUserPostEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		var span stdopentracing.Span
-		span, ctx = stdopentracing.StartSpanFromContext(ctx, "post user")
-		span.SetTag("service", "user")
-		defer span.Finish()
+		db.SetTraceContext(ctx)
 		req := request.(users.User)
 		id, err := s.PostUser(req)
 		return postResponse{ID: id}, err
@@ -126,14 +228,9 @@ func MakeUserPostEndpoint(s Service) endpoint.Endpoint {
 // MakeAddressGetEndpoint returns an endpoint via the given service.
 func MakeAddressGetEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		var span stdopentracing.Span
-		span, ctx = stdopentracing.StartSpanFromContext(ctx, "get users")
-		span.SetTag("service", "user")
-		defer span.Finish()
+		db.SetTraceContext(ctx)
 		req := request.(GetRequest)
-		addrspan := stdopentracing.StartSpan("addresses from db", stdopentracing.ChildOf(span.Context()))
 		adds, err := s.GetAddresses(req.ID)
-		addrspan.Finish()
 		if req.ID == "" {
 			return EmbedStruct{addressesResponse{Addresses: adds}}, err
 		}
@@ -147,27 +244,19 @@ func MakeAddressGetEndpoint(s Service) endpoint.Endpoint {
 // MakeAddressPostEndpoint returns an endpoint via the given service.
 func MakeAddressPostEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		var span stdopentracing.Span
-		span, ctx = stdopentracing.StartSpanFromContext(ctx, "post address")
-		span.SetTag("service", "user")
-		defer span.Finish()
+		db.SetTraceContext(ctx)
 		req := request.(addressPostRequest)
 		id, err := s.PostAddress(req.Address, req.UserID)
 		return postResponse{ID: id}, err
 	}
 }
 
-// MakeUserGetEndpoint returns an endpoint via the given service.
+// MakeCardGetEndpoint returns an endpoint via the given service.
 func MakeCardGetEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		var span stdopentracing.Span
-		span, ctx = stdopentracing.StartSpanFromContext(ctx, "get cards")
-		span.SetTag("service", "user")
-		defer span.Finish()
+		db.SetTraceContext(ctx)
 		req := request.(GetRequest)
-		cardspan := stdopentracing.StartSpan("addresses from db", stdopentracing.ChildOf(span.Context()))
 		cards, err := s.GetCards(req.ID)
-		cardspan.Finish()
 		if req.ID == "" {
 			return EmbedStruct{cardsResponse{Cards: cards}}, err
 		}
@@ -181,23 +270,17 @@ func MakeCardGetEndpoint(s Service) endpoint.Endpoint {
 // MakeCardPostEndpoint returns an endpoint via the given service.
 func MakeCardPostEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		var span stdopentracing.Span
-		span, ctx = stdopentracing.StartSpanFromContext(ctx, "post card")
-		span.SetTag("service", "user")
-		defer span.Finish()
+		db.SetTraceContext(ctx)
 		req := request.(cardPostRequest)
 		id, err := s.PostCard(req.Card, req.UserID)
 		return postResponse{ID: id}, err
 	}
 }
 
-// MakeLoginEndpoint returns an endpoint via the given service.
+// MakeDeleteEndpoint returns an endpoint via the given service.
 func MakeDeleteEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		var span stdopentracing.Span
-		span, ctx = stdopentracing.StartSpanFromContext(ctx, "delete entity")
-		span.SetTag("service", "user")
-		defer span.Finish()
+		db.SetTraceContext(ctx)
 		req := request.(deleteRequest)
 		err = s.Delete(req.Entity, req.ID)
 		if err == nil {

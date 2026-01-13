@@ -1,6 +1,7 @@
 package mongodb
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/microservices-demo/user/users"
+	stdopentracing "github.com/opentracing/opentracing-go"
 
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
@@ -22,6 +24,16 @@ var (
 	//ErrInvalidHexID represents a entity id that is not a valid bson ObjectID
 	ErrInvalidHexID = errors.New("Invalid Id Hex")
 )
+
+// Package-level context for tracing - set by the db package
+var traceContext context.Context = context.Background()
+
+// SetTraceContext sets the context for tracing MongoDB operations
+func SetTraceContext(ctx context.Context) {
+	if ctx != nil {
+		traceContext = ctx
+	}
+}
 
 func init() {
 	flag.StringVar(&name, "mongo-user", os.Getenv("MONGO_USER"), "Mongo user")
@@ -107,6 +119,17 @@ func (m *MongoCard) AddID() {
 
 // CreateUser Insert user to MongoDB, including connected addresses and cards, update passed in user with Ids
 func (m *Mongo) CreateUser(u *users.User) error {
+	var span stdopentracing.Span
+	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+		span = stdopentracing.StartSpan("mongodb: create user", stdopentracing.ChildOf(parentSpan.Context()))
+	} else {
+		span = stdopentracing.GlobalTracer().StartSpan("mongodb: create user")
+	}
+	span.SetTag("db.type", "mongodb")
+	span.SetTag("db.collection", "customers")
+	span.SetTag("username", u.Username)
+	defer span.Finish()
+
 	s := m.Session.Copy()
 	defer s.Close()
 	id := bson.NewObjectId()
@@ -120,6 +143,8 @@ func (m *Mongo) CreateUser(u *users.User) error {
 	c := s.DB("").C("customers")
 	_, err := c.UpsertId(mu.ID, mu)
 	if err != nil {
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
 		// Gonna clean up if we can, ignore error
 		// because the user save error takes precedence.
 		m.cleanAttributes(mu)
@@ -128,6 +153,8 @@ func (m *Mongo) CreateUser(u *users.User) error {
 	mu.User.UserID = mu.ID.Hex()
 	// Cheap err for attributes
 	if carderr != nil || addrerr != nil {
+		span.SetTag("error", true)
+		span.SetTag("error.message", fmt.Sprintf("%v %v", carderr, addrerr))
 		return fmt.Errorf("%v %v", carderr, addrerr)
 	}
 	*u = mu.User
@@ -199,37 +226,86 @@ func (m *Mongo) removeAttributeId(attr string, id bson.ObjectId, userid string) 
 
 // GetUserByName Get user by their name
 func (m *Mongo) GetUserByName(name string) (users.User, error) {
+	var span stdopentracing.Span
+	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+		span = stdopentracing.StartSpan("mongodb: find user by name", stdopentracing.ChildOf(parentSpan.Context()))
+	} else {
+		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find user by name")
+	}
+	span.SetTag("db.type", "mongodb")
+	span.SetTag("db.collection", "customers")
+	span.SetTag("username", name)
+	defer span.Finish()
+
 	s := m.Session.Copy()
 	defer s.Close()
 	c := s.DB("").C("customers")
 	mu := New()
 	err := c.Find(bson.M{"username": name}).One(&mu)
+	if err != nil {
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+	}
 	mu.AddUserIDs()
 	return mu.User, err
 }
 
 // GetUser Get user by their object id
 func (m *Mongo) GetUser(id string) (users.User, error) {
+	var span stdopentracing.Span
+	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+		span = stdopentracing.StartSpan("mongodb: find user by id", stdopentracing.ChildOf(parentSpan.Context()))
+	} else {
+		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find user by id")
+	}
+	span.SetTag("db.type", "mongodb")
+	span.SetTag("db.collection", "customers")
+	span.SetTag("user.id", id)
+	defer span.Finish()
+
 	s := m.Session.Copy()
 	defer s.Close()
 	if !bson.IsObjectIdHex(id) {
-		return users.New(), errors.New("Invalid Id Hex")
+		err := errors.New("Invalid Id Hex")
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+		return users.New(), err
 	}
 	c := s.DB("").C("customers")
 	mu := New()
 	err := c.FindId(bson.ObjectIdHex(id)).One(&mu)
+	if err != nil {
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+	}
 	mu.AddUserIDs()
 	return mu.User, err
 }
 
 // GetUsers Get all users
 func (m *Mongo) GetUsers() ([]users.User, error) {
+	var span stdopentracing.Span
+	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+		span = stdopentracing.StartSpan("mongodb: find all users", stdopentracing.ChildOf(parentSpan.Context()))
+	} else {
+		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find all users")
+	}
+	span.SetTag("db.type", "mongodb")
+	span.SetTag("db.collection", "customers")
+	defer span.Finish()
+
 	// TODO: add paginations
 	s := m.Session.Copy()
 	defer s.Close()
 	c := s.DB("").C("customers")
 	var mus []MongoUser
 	err := c.Find(nil).All(&mus)
+	if err != nil {
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+	} else {
+		span.SetTag("result.count", len(mus))
+	}
 	us := make([]users.User, 0)
 	for _, mu := range mus {
 		mu.AddUserIDs()
@@ -240,11 +316,29 @@ func (m *Mongo) GetUsers() ([]users.User, error) {
 
 // GetUserAttributes given a user, load all cards and addresses connected to that user
 func (m *Mongo) GetUserAttributes(u *users.User) error {
+	var span stdopentracing.Span
+	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+		span = stdopentracing.StartSpan("mongodb: get user attributes", stdopentracing.ChildOf(parentSpan.Context()))
+	} else {
+		span = stdopentracing.GlobalTracer().StartSpan("mongodb: get user attributes")
+	}
+	span.SetTag("db.type", "mongodb")
+	span.SetTag("user.id", u.UserID)
+	defer span.Finish()
+
 	s := m.Session.Copy()
 	defer s.Close()
+
+	// Fetch addresses
+	addrSpan := stdopentracing.StartSpan("mongodb: find addresses", stdopentracing.ChildOf(span.Context()))
+	addrSpan.SetTag("db.collection", "addresses")
 	ids := make([]bson.ObjectId, 0)
 	for _, a := range u.Addresses {
 		if !bson.IsObjectIdHex(a.ID) {
+			addrSpan.SetTag("error", true)
+			addrSpan.SetTag("error.message", ErrInvalidHexID.Error())
+			addrSpan.Finish()
+			span.SetTag("error", true)
 			return ErrInvalidHexID
 		}
 		ids = append(ids, bson.ObjectIdHex(a.ID))
@@ -253,8 +347,15 @@ func (m *Mongo) GetUserAttributes(u *users.User) error {
 	c := s.DB("").C("addresses")
 	err := c.Find(bson.M{"_id": bson.M{"$in": ids}}).All(&ma)
 	if err != nil {
+		addrSpan.SetTag("error", true)
+		addrSpan.SetTag("error.message", err.Error())
+		addrSpan.Finish()
+		span.SetTag("error", true)
 		return err
 	}
+	addrSpan.SetTag("result.count", len(ma))
+	addrSpan.Finish()
+
 	na := make([]users.Address, 0)
 	for _, a := range ma {
 		a.Address.ID = a.ID.Hex()
@@ -262,9 +363,16 @@ func (m *Mongo) GetUserAttributes(u *users.User) error {
 	}
 	u.Addresses = na
 
+	// Fetch cards
+	cardSpan := stdopentracing.StartSpan("mongodb: find cards", stdopentracing.ChildOf(span.Context()))
+	cardSpan.SetTag("db.collection", "cards")
 	ids = make([]bson.ObjectId, 0)
 	for _, c := range u.Cards {
 		if !bson.IsObjectIdHex(c.ID) {
+			cardSpan.SetTag("error", true)
+			cardSpan.SetTag("error.message", ErrInvalidHexID.Error())
+			cardSpan.Finish()
+			span.SetTag("error", true)
 			return ErrInvalidHexID
 		}
 		ids = append(ids, bson.ObjectIdHex(c.ID))
@@ -273,8 +381,14 @@ func (m *Mongo) GetUserAttributes(u *users.User) error {
 	c = s.DB("").C("cards")
 	err = c.Find(bson.M{"_id": bson.M{"$in": ids}}).All(&mc)
 	if err != nil {
+		cardSpan.SetTag("error", true)
+		cardSpan.SetTag("error.message", err.Error())
+		cardSpan.Finish()
+		span.SetTag("error", true)
 		return err
 	}
+	cardSpan.SetTag("result.count", len(mc))
+	cardSpan.Finish()
 
 	nc := make([]users.Card, 0)
 	for _, ca := range mc {
@@ -287,26 +401,60 @@ func (m *Mongo) GetUserAttributes(u *users.User) error {
 
 // GetCard Gets card by objects Id
 func (m *Mongo) GetCard(id string) (users.Card, error) {
+	var span stdopentracing.Span
+	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+		span = stdopentracing.StartSpan("mongodb: find card by id", stdopentracing.ChildOf(parentSpan.Context()))
+	} else {
+		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find card by id")
+	}
+	span.SetTag("db.type", "mongodb")
+	span.SetTag("db.collection", "cards")
+	span.SetTag("card.id", id)
+	defer span.Finish()
+
 	s := m.Session.Copy()
 	defer s.Close()
 	if !bson.IsObjectIdHex(id) {
-		return users.Card{}, errors.New("Invalid Id Hex")
+		err := errors.New("Invalid Id Hex")
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+		return users.Card{}, err
 	}
 	c := s.DB("").C("cards")
 	mc := MongoCard{}
 	err := c.FindId(bson.ObjectIdHex(id)).One(&mc)
+	if err != nil {
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+	}
 	mc.AddID()
 	return mc.Card, err
 }
 
 // GetCards Gets all cards
 func (m *Mongo) GetCards() ([]users.Card, error) {
+	var span stdopentracing.Span
+	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+		span = stdopentracing.StartSpan("mongodb: find all cards", stdopentracing.ChildOf(parentSpan.Context()))
+	} else {
+		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find all cards")
+	}
+	span.SetTag("db.type", "mongodb")
+	span.SetTag("db.collection", "cards")
+	defer span.Finish()
+
 	// TODO: add pagination
 	s := m.Session.Copy()
 	defer s.Close()
 	c := s.DB("").C("cards")
 	var mcs []MongoCard
 	err := c.Find(nil).All(&mcs)
+	if err != nil {
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+	} else {
+		span.SetTag("result.count", len(mcs))
+	}
 	cs := make([]users.Card, 0)
 	for _, mc := range mcs {
 		mc.AddID()
@@ -317,8 +465,22 @@ func (m *Mongo) GetCards() ([]users.Card, error) {
 
 // CreateCard adds card to MongoDB
 func (m *Mongo) CreateCard(ca *users.Card, userid string) error {
+	var span stdopentracing.Span
+	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+		span = stdopentracing.StartSpan("mongodb: create card", stdopentracing.ChildOf(parentSpan.Context()))
+	} else {
+		span = stdopentracing.GlobalTracer().StartSpan("mongodb: create card")
+	}
+	span.SetTag("db.type", "mongodb")
+	span.SetTag("db.collection", "cards")
+	span.SetTag("user.id", userid)
+	defer span.Finish()
+
 	if userid != "" && !bson.IsObjectIdHex(userid) {
-		return errors.New("Invalid Id Hex")
+		err := errors.New("Invalid Id Hex")
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+		return err
 	}
 	s := m.Session.Copy()
 	defer s.Close()
@@ -327,12 +489,16 @@ func (m *Mongo) CreateCard(ca *users.Card, userid string) error {
 	mc := MongoCard{Card: *ca, ID: id}
 	_, err := c.UpsertId(mc.ID, mc)
 	if err != nil {
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
 		return err
 	}
 	// Address for anonymous user
 	if userid != "" {
 		err = m.appendAttributeId("cards", mc.ID, userid)
 		if err != nil {
+			span.SetTag("error", true)
+			span.SetTag("error.message", err.Error())
 			return err
 		}
 	}
@@ -343,26 +509,60 @@ func (m *Mongo) CreateCard(ca *users.Card, userid string) error {
 
 // GetAddress Gets an address by object Id
 func (m *Mongo) GetAddress(id string) (users.Address, error) {
+	var span stdopentracing.Span
+	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+		span = stdopentracing.StartSpan("mongodb: find address by id", stdopentracing.ChildOf(parentSpan.Context()))
+	} else {
+		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find address by id")
+	}
+	span.SetTag("db.type", "mongodb")
+	span.SetTag("db.collection", "addresses")
+	span.SetTag("address.id", id)
+	defer span.Finish()
+
 	s := m.Session.Copy()
 	defer s.Close()
 	if !bson.IsObjectIdHex(id) {
-		return users.Address{}, errors.New("Invalid Id Hex")
+		err := errors.New("Invalid Id Hex")
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+		return users.Address{}, err
 	}
 	c := s.DB("").C("addresses")
 	ma := MongoAddress{}
 	err := c.FindId(bson.ObjectIdHex(id)).One(&ma)
+	if err != nil {
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+	}
 	ma.AddID()
 	return ma.Address, err
 }
 
 // GetAddresses gets all addresses
 func (m *Mongo) GetAddresses() ([]users.Address, error) {
+	var span stdopentracing.Span
+	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+		span = stdopentracing.StartSpan("mongodb: find all addresses", stdopentracing.ChildOf(parentSpan.Context()))
+	} else {
+		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find all addresses")
+	}
+	span.SetTag("db.type", "mongodb")
+	span.SetTag("db.collection", "addresses")
+	defer span.Finish()
+
 	// TODO: add pagination
 	s := m.Session.Copy()
 	defer s.Close()
 	c := s.DB("").C("addresses")
 	var mas []MongoAddress
 	err := c.Find(nil).All(&mas)
+	if err != nil {
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+	} else {
+		span.SetTag("result.count", len(mas))
+	}
 	as := make([]users.Address, 0)
 	for _, ma := range mas {
 		ma.AddID()
@@ -373,8 +573,22 @@ func (m *Mongo) GetAddresses() ([]users.Address, error) {
 
 // CreateAddress Inserts Address into MongoDB
 func (m *Mongo) CreateAddress(a *users.Address, userid string) error {
+	var span stdopentracing.Span
+	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+		span = stdopentracing.StartSpan("mongodb: create address", stdopentracing.ChildOf(parentSpan.Context()))
+	} else {
+		span = stdopentracing.GlobalTracer().StartSpan("mongodb: create address")
+	}
+	span.SetTag("db.type", "mongodb")
+	span.SetTag("db.collection", "addresses")
+	span.SetTag("user.id", userid)
+	defer span.Finish()
+
 	if userid != "" && !bson.IsObjectIdHex(userid) {
-		return errors.New("Invalid Id Hex")
+		err := errors.New("Invalid Id Hex")
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+		return err
 	}
 	s := m.Session.Copy()
 	defer s.Close()
@@ -383,12 +597,16 @@ func (m *Mongo) CreateAddress(a *users.Address, userid string) error {
 	ma := MongoAddress{Address: *a, ID: id}
 	_, err := c.UpsertId(ma.ID, ma)
 	if err != nil {
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
 		return err
 	}
 	// Address for anonymous user
 	if userid != "" {
 		err = m.appendAttributeId("addresses", ma.ID, userid)
 		if err != nil {
+			span.SetTag("error", true)
+			span.SetTag("error.message", err.Error())
 			return err
 		}
 	}
@@ -397,10 +615,24 @@ func (m *Mongo) CreateAddress(a *users.Address, userid string) error {
 	return err
 }
 
-// CreateAddress Inserts Address into MongoDB
+// Delete removes an entity from MongoDB
 func (m *Mongo) Delete(entity, id string) error {
+	var span stdopentracing.Span
+	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+		span = stdopentracing.StartSpan("mongodb: delete entity", stdopentracing.ChildOf(parentSpan.Context()))
+	} else {
+		span = stdopentracing.GlobalTracer().StartSpan("mongodb: delete entity")
+	}
+	span.SetTag("db.type", "mongodb")
+	span.SetTag("db.collection", entity)
+	span.SetTag("entity.id", id)
+	defer span.Finish()
+
 	if !bson.IsObjectIdHex(id) {
-		return errors.New("Invalid Id Hex")
+		err := errors.New("Invalid Id Hex")
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+		return err
 	}
 	s := m.Session.Copy()
 	defer s.Close()
@@ -408,6 +640,8 @@ func (m *Mongo) Delete(entity, id string) error {
 	if entity == "customers" {
 		u, err := m.GetUser(id)
 		if err != nil {
+			span.SetTag("error", true)
+			span.SetTag("error.message", err.Error())
 			return err
 		}
 		aids := make([]bson.ObjectId, 0)
@@ -427,7 +661,12 @@ func (m *Mongo) Delete(entity, id string) error {
 		c.UpdateAll(bson.M{},
 			bson.M{"$pull": bson.M{entity: bson.ObjectIdHex(id)}})
 	}
-	return c.Remove(bson.M{"_id": bson.ObjectIdHex(id)})
+	err := c.Remove(bson.M{"_id": bson.ObjectIdHex(id)})
+	if err != nil {
+		span.SetTag("error", true)
+		span.SetTag("error.message", err.Error())
+	}
+	return err
 }
 
 func getURL() url.URL {
