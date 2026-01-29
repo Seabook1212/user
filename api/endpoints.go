@@ -15,6 +15,7 @@ import (
 	"github.com/microservices-demo/user/db"
 	"github.com/microservices-demo/user/users"
 	stdopentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go/ext"
 	zipkinot "github.com/openzipkin-contrib/zipkin-go-opentracing"
 )
 
@@ -40,13 +41,15 @@ func MakeEndpoints(s Service, tracer stdopentracing.Tracer, logger log.Logger) E
 		return func(next endpoint.Endpoint) endpoint.Endpoint {
 			return func(ctx context.Context, request interface{}) (interface{}, error) {
 				begin := time.Now()
-				response, err := next(ctx, request)
 
-				// Extract trace information from context
+				// Extract trace information from context and set span kind BEFORE processing
 				span := stdopentracing.SpanFromContext(ctx)
 				traceid := ""
 				spanid := ""
 				if span != nil {
+					// Set span kind to SERVER for HTTP entry points
+					ext.SpanKindRPCServer.Set(span)
+					span.SetTag("span.kind", "server")
 					if sc, ok := span.Context().(zipkinot.SpanContext); ok {
 						// Format trace ID - use Low part for 64-bit trace IDs
 						traceid = fmt.Sprintf("%x", sc.TraceID.Low)
@@ -54,6 +57,9 @@ func MakeEndpoints(s Service, tracer stdopentracing.Tracer, logger log.Logger) E
 						spanid = fmt.Sprintf("%x", uint64(sc.ID))
 					}
 				}
+
+				// Process the request
+				response, err := next(ctx, request)
 
 				// Build log message
 				logArgs := []interface{}{

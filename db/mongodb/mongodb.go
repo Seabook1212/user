@@ -11,6 +11,7 @@ import (
 
 	"github.com/microservices-demo/user/users"
 	stdopentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go/ext"
 
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
@@ -33,6 +34,36 @@ func SetTraceContext(ctx context.Context) {
 	if ctx != nil {
 		traceContext = ctx
 	}
+}
+
+// setMongoDBSpanTags sets common tags for MongoDB spans (called after span creation)
+func setMongoDBSpanTags(span stdopentracing.Span, collection string) {
+	// Database-related tags
+	ext.DBType.Set(span, "mongodb")
+	span.SetTag("db.system", "mongodb")
+	span.SetTag("span.kind", "client")
+	if collection != "" {
+		span.SetTag("db.collection", collection)
+	}
+	// Peer service information
+	if host != "" {
+		ext.PeerAddress.Set(span, host)
+		ext.PeerService.Set(span, host)
+		span.SetTag("peer.service", host)
+	}
+}
+
+// startMongoDBSpan creates a new span with CLIENT kind for MongoDB operations
+func startMongoDBSpan(name string) stdopentracing.Span {
+	var span stdopentracing.Span
+	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+		span = stdopentracing.StartSpan(name,
+			stdopentracing.ChildOf(parentSpan.Context()),
+			ext.SpanKindRPCClient)
+	} else {
+		span = stdopentracing.GlobalTracer().StartSpan(name, ext.SpanKindRPCClient)
+	}
+	return span
 }
 
 func init() {
@@ -119,14 +150,8 @@ func (m *MongoCard) AddID() {
 
 // CreateUser Insert user to MongoDB, including connected addresses and cards, update passed in user with Ids
 func (m *Mongo) CreateUser(u *users.User) error {
-	var span stdopentracing.Span
-	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
-		span = stdopentracing.StartSpan("mongodb: create user", stdopentracing.ChildOf(parentSpan.Context()))
-	} else {
-		span = stdopentracing.GlobalTracer().StartSpan("mongodb: create user")
-	}
-	span.SetTag("db.type", "mongodb")
-	span.SetTag("db.collection", "customers")
+	span := startMongoDBSpan("mongodb: create user")
+	setMongoDBSpanTags(span, "customers")
 	span.SetTag("username", u.Username)
 	defer span.Finish()
 
@@ -226,14 +251,8 @@ func (m *Mongo) removeAttributeId(attr string, id bson.ObjectId, userid string) 
 
 // GetUserByName Get user by their name
 func (m *Mongo) GetUserByName(name string) (users.User, error) {
-	var span stdopentracing.Span
-	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
-		span = stdopentracing.StartSpan("mongodb: find user by name", stdopentracing.ChildOf(parentSpan.Context()))
-	} else {
-		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find user by name")
-	}
-	span.SetTag("db.type", "mongodb")
-	span.SetTag("db.collection", "customers")
+	span := startMongoDBSpan("mongodb: find user by name")
+	setMongoDBSpanTags(span, "customers")
 	span.SetTag("username", name)
 	defer span.Finish()
 
@@ -252,14 +271,8 @@ func (m *Mongo) GetUserByName(name string) (users.User, error) {
 
 // GetUser Get user by their object id
 func (m *Mongo) GetUser(id string) (users.User, error) {
-	var span stdopentracing.Span
-	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
-		span = stdopentracing.StartSpan("mongodb: find user by id", stdopentracing.ChildOf(parentSpan.Context()))
-	} else {
-		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find user by id")
-	}
-	span.SetTag("db.type", "mongodb")
-	span.SetTag("db.collection", "customers")
+	span := startMongoDBSpan("mongodb: find user by id")
+	setMongoDBSpanTags(span, "customers")
 	span.SetTag("user.id", id)
 	defer span.Finish()
 
@@ -284,14 +297,8 @@ func (m *Mongo) GetUser(id string) (users.User, error) {
 
 // GetUsers Get all users
 func (m *Mongo) GetUsers() ([]users.User, error) {
-	var span stdopentracing.Span
-	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
-		span = stdopentracing.StartSpan("mongodb: find all users", stdopentracing.ChildOf(parentSpan.Context()))
-	} else {
-		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find all users")
-	}
-	span.SetTag("db.type", "mongodb")
-	span.SetTag("db.collection", "customers")
+	span := startMongoDBSpan("mongodb: find all users")
+	setMongoDBSpanTags(span, "customers")
 	defer span.Finish()
 
 	// TODO: add paginations
@@ -316,29 +323,19 @@ func (m *Mongo) GetUsers() ([]users.User, error) {
 
 // GetUserAttributes given a user, load all cards and addresses connected to that user
 func (m *Mongo) GetUserAttributes(u *users.User) error {
-	var span stdopentracing.Span
-	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
-		span = stdopentracing.StartSpan("mongodb: get user attributes", stdopentracing.ChildOf(parentSpan.Context()))
-	} else {
-		span = stdopentracing.GlobalTracer().StartSpan("mongodb: get user attributes")
-	}
-	span.SetTag("db.type", "mongodb")
-	span.SetTag("user.id", u.UserID)
-	defer span.Finish()
-
 	s := m.Session.Copy()
 	defer s.Close()
 
-	// Fetch addresses
-	addrSpan := stdopentracing.StartSpan("mongodb: find addresses", stdopentracing.ChildOf(span.Context()))
-	addrSpan.SetTag("db.collection", "addresses")
+	// Fetch addresses - directly connect to HTTP request span
+	addrSpan := startMongoDBSpan("mongodb: find addresses")
+	setMongoDBSpanTags(addrSpan, "addresses")
+	addrSpan.SetTag("user.id", u.UserID)
 	ids := make([]bson.ObjectId, 0)
 	for _, a := range u.Addresses {
 		if !bson.IsObjectIdHex(a.ID) {
 			addrSpan.SetTag("error", true)
 			addrSpan.SetTag("error.message", ErrInvalidHexID.Error())
 			addrSpan.Finish()
-			span.SetTag("error", true)
 			return ErrInvalidHexID
 		}
 		ids = append(ids, bson.ObjectIdHex(a.ID))
@@ -350,7 +347,6 @@ func (m *Mongo) GetUserAttributes(u *users.User) error {
 		addrSpan.SetTag("error", true)
 		addrSpan.SetTag("error.message", err.Error())
 		addrSpan.Finish()
-		span.SetTag("error", true)
 		return err
 	}
 	addrSpan.SetTag("result.count", len(ma))
@@ -363,16 +359,16 @@ func (m *Mongo) GetUserAttributes(u *users.User) error {
 	}
 	u.Addresses = na
 
-	// Fetch cards
-	cardSpan := stdopentracing.StartSpan("mongodb: find cards", stdopentracing.ChildOf(span.Context()))
-	cardSpan.SetTag("db.collection", "cards")
+	// Fetch cards - directly connect to HTTP request span
+	cardSpan := startMongoDBSpan("mongodb: find cards")
+	setMongoDBSpanTags(cardSpan, "cards")
+	cardSpan.SetTag("user.id", u.UserID)
 	ids = make([]bson.ObjectId, 0)
 	for _, c := range u.Cards {
 		if !bson.IsObjectIdHex(c.ID) {
 			cardSpan.SetTag("error", true)
 			cardSpan.SetTag("error.message", ErrInvalidHexID.Error())
 			cardSpan.Finish()
-			span.SetTag("error", true)
 			return ErrInvalidHexID
 		}
 		ids = append(ids, bson.ObjectIdHex(c.ID))
@@ -384,7 +380,6 @@ func (m *Mongo) GetUserAttributes(u *users.User) error {
 		cardSpan.SetTag("error", true)
 		cardSpan.SetTag("error.message", err.Error())
 		cardSpan.Finish()
-		span.SetTag("error", true)
 		return err
 	}
 	cardSpan.SetTag("result.count", len(mc))
@@ -401,14 +396,8 @@ func (m *Mongo) GetUserAttributes(u *users.User) error {
 
 // GetCard Gets card by objects Id
 func (m *Mongo) GetCard(id string) (users.Card, error) {
-	var span stdopentracing.Span
-	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
-		span = stdopentracing.StartSpan("mongodb: find card by id", stdopentracing.ChildOf(parentSpan.Context()))
-	} else {
-		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find card by id")
-	}
-	span.SetTag("db.type", "mongodb")
-	span.SetTag("db.collection", "cards")
+	span := startMongoDBSpan("mongodb: find card by id")
+	setMongoDBSpanTags(span, "cards")
 	span.SetTag("card.id", id)
 	defer span.Finish()
 
@@ -433,14 +422,8 @@ func (m *Mongo) GetCard(id string) (users.Card, error) {
 
 // GetCards Gets all cards
 func (m *Mongo) GetCards() ([]users.Card, error) {
-	var span stdopentracing.Span
-	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
-		span = stdopentracing.StartSpan("mongodb: find all cards", stdopentracing.ChildOf(parentSpan.Context()))
-	} else {
-		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find all cards")
-	}
-	span.SetTag("db.type", "mongodb")
-	span.SetTag("db.collection", "cards")
+	span := startMongoDBSpan("mongodb: find all cards")
+	setMongoDBSpanTags(span, "cards")
 	defer span.Finish()
 
 	// TODO: add pagination
@@ -465,14 +448,8 @@ func (m *Mongo) GetCards() ([]users.Card, error) {
 
 // CreateCard adds card to MongoDB
 func (m *Mongo) CreateCard(ca *users.Card, userid string) error {
-	var span stdopentracing.Span
-	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
-		span = stdopentracing.StartSpan("mongodb: create card", stdopentracing.ChildOf(parentSpan.Context()))
-	} else {
-		span = stdopentracing.GlobalTracer().StartSpan("mongodb: create card")
-	}
-	span.SetTag("db.type", "mongodb")
-	span.SetTag("db.collection", "cards")
+	span := startMongoDBSpan("mongodb: create card")
+	setMongoDBSpanTags(span, "cards")
 	span.SetTag("user.id", userid)
 	defer span.Finish()
 
@@ -509,14 +486,8 @@ func (m *Mongo) CreateCard(ca *users.Card, userid string) error {
 
 // GetAddress Gets an address by object Id
 func (m *Mongo) GetAddress(id string) (users.Address, error) {
-	var span stdopentracing.Span
-	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
-		span = stdopentracing.StartSpan("mongodb: find address by id", stdopentracing.ChildOf(parentSpan.Context()))
-	} else {
-		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find address by id")
-	}
-	span.SetTag("db.type", "mongodb")
-	span.SetTag("db.collection", "addresses")
+	span := startMongoDBSpan("mongodb: find address by id")
+	setMongoDBSpanTags(span, "addresses")
 	span.SetTag("address.id", id)
 	defer span.Finish()
 
@@ -541,14 +512,8 @@ func (m *Mongo) GetAddress(id string) (users.Address, error) {
 
 // GetAddresses gets all addresses
 func (m *Mongo) GetAddresses() ([]users.Address, error) {
-	var span stdopentracing.Span
-	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
-		span = stdopentracing.StartSpan("mongodb: find all addresses", stdopentracing.ChildOf(parentSpan.Context()))
-	} else {
-		span = stdopentracing.GlobalTracer().StartSpan("mongodb: find all addresses")
-	}
-	span.SetTag("db.type", "mongodb")
-	span.SetTag("db.collection", "addresses")
+	span := startMongoDBSpan("mongodb: find all addresses")
+	setMongoDBSpanTags(span, "addresses")
 	defer span.Finish()
 
 	// TODO: add pagination
@@ -573,14 +538,8 @@ func (m *Mongo) GetAddresses() ([]users.Address, error) {
 
 // CreateAddress Inserts Address into MongoDB
 func (m *Mongo) CreateAddress(a *users.Address, userid string) error {
-	var span stdopentracing.Span
-	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
-		span = stdopentracing.StartSpan("mongodb: create address", stdopentracing.ChildOf(parentSpan.Context()))
-	} else {
-		span = stdopentracing.GlobalTracer().StartSpan("mongodb: create address")
-	}
-	span.SetTag("db.type", "mongodb")
-	span.SetTag("db.collection", "addresses")
+	span := startMongoDBSpan("mongodb: create address")
+	setMongoDBSpanTags(span, "addresses")
 	span.SetTag("user.id", userid)
 	defer span.Finish()
 
@@ -617,14 +576,8 @@ func (m *Mongo) CreateAddress(a *users.Address, userid string) error {
 
 // Delete removes an entity from MongoDB
 func (m *Mongo) Delete(entity, id string) error {
-	var span stdopentracing.Span
-	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
-		span = stdopentracing.StartSpan("mongodb: delete entity", stdopentracing.ChildOf(parentSpan.Context()))
-	} else {
-		span = stdopentracing.GlobalTracer().StartSpan("mongodb: delete entity")
-	}
-	span.SetTag("db.type", "mongodb")
-	span.SetTag("db.collection", entity)
+	span := startMongoDBSpan("mongodb: delete entity")
+	setMongoDBSpanTags(span, entity)
 	span.SetTag("entity.id", id)
 	defer span.Finish()
 
