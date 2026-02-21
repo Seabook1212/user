@@ -2,6 +2,8 @@ module github.com/microservices-demo/user
 
 go 1.22
 
+replace github.com/openzipkin-contrib/zipkin-go-opentracing => ./third_party/zipkin-go-opentracing
+
 require (
 	github.com/go-kit/kit v0.13.0
 	github.com/gorilla/mux v1.8.1

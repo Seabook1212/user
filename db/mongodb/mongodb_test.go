@@ -163,3 +163,48 @@ func TestPing(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+func TestResolvePeerServiceName(t *testing.T) {
+	testCases := []struct {
+		name     string
+		rawHost  string
+		expected string
+	}{
+		{
+			name:     "empty host defaults to user-db",
+			rawHost:  "",
+			expected: "user-db",
+		},
+		{
+			name:     "service name with port",
+			rawHost:  "user-db:27017",
+			expected: "user-db",
+		},
+		{
+			name:     "localhost maps to user-db",
+			rawHost:  "localhost:27017",
+			expected: "user-db",
+		},
+		{
+			name:     "k8s dns name maps to service",
+			rawHost:  "user-db.default.svc.cluster.local:27017",
+			expected: "user-db",
+		},
+		{
+			name:     "other service host with port",
+			rawHost:  "orders-db:27017",
+			expected: "orders-db",
+		},
+		{
+			name:     "multiple hosts uses first host",
+			rawHost:  "user-db:27017,user-db-2:27017",
+			expected: "user-db",
+		},
+	}
+
+	for _, tc := range testCases {
+		if actual := resolvePeerServiceName(tc.rawHost); actual != tc.expected {
+			t.Errorf("%s: expected %q, got %q", tc.name, tc.expected, actual)
+		}
+	}
+}

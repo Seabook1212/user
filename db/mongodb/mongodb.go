@@ -5,8 +5,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/microservices-demo/user/users"
@@ -26,6 +28,8 @@ var (
 	ErrInvalidHexID = errors.New("Invalid Id Hex")
 )
 
+const defaultMongoPeerService = "user-db"
+
 // Package-level context for tracing - set by the db package
 var traceContext context.Context = context.Background()
 
@@ -41,27 +45,74 @@ func setMongoDBSpanTags(span stdopentracing.Span, collection string) {
 	// Database-related tags
 	ext.DBType.Set(span, "mongodb")
 	span.SetTag("db.system", "mongodb")
-	span.SetTag("span.kind", "client")
 	if collection != "" {
 		span.SetTag("db.collection", collection)
 	}
-	// Peer service information
+	// Peer address information
 	if host != "" {
 		ext.PeerAddress.Set(span, host)
-		ext.PeerService.Set(span, host)
-		span.SetTag("peer.service", host)
 	}
+}
+
+func resolvePeerServiceName(rawHost string) string {
+	if rawHost == "" {
+		return defaultMongoPeerService
+	}
+
+	peer := strings.TrimSpace(strings.Split(rawHost, ",")[0])
+	if peer == "" {
+		return defaultMongoPeerService
+	}
+
+	if strings.Contains(peer, "://") {
+		if parsedURL, err := url.Parse(peer); err == nil && parsedURL.Host != "" {
+			peer = parsedURL.Host
+		}
+	}
+
+	peer = strings.TrimPrefix(peer, "[")
+	peer = strings.TrimSuffix(peer, "]")
+
+	if hostOnly, _, err := net.SplitHostPort(peer); err == nil && hostOnly != "" {
+		peer = hostOnly
+	} else if strings.Count(peer, ":") == 1 {
+		parts := strings.SplitN(peer, ":", 2)
+		peer = parts[0]
+	}
+
+	peer = strings.TrimSpace(peer)
+	if peer == "" {
+		return defaultMongoPeerService
+	}
+
+	switch peer {
+	case "localhost", "127.0.0.1", "::1":
+		return defaultMongoPeerService
+	}
+
+	if strings.Contains(peer, ".") {
+		parts := strings.Split(peer, ".")
+		if parts[0] != "" {
+			return parts[0]
+		}
+	}
+
+	return peer
 }
 
 // startMongoDBSpan creates a new span with CLIENT kind for MongoDB operations
 func startMongoDBSpan(name string) stdopentracing.Span {
+	startOpts := []stdopentracing.StartSpanOption{
+		ext.SpanKindRPCClient,
+		stdopentracing.Tag{Key: string(ext.PeerService), Value: resolvePeerServiceName(host)},
+	}
+
 	var span stdopentracing.Span
 	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
-		span = stdopentracing.StartSpan(name,
-			stdopentracing.ChildOf(parentSpan.Context()),
-			ext.SpanKindRPCClient)
+		startOpts = append(startOpts, stdopentracing.ChildOf(parentSpan.Context()))
+		span = stdopentracing.StartSpan(name, startOpts...)
 	} else {
-		span = stdopentracing.GlobalTracer().StartSpan(name, ext.SpanKindRPCClient)
+		span = stdopentracing.GlobalTracer().StartSpan(name, startOpts...)
 	}
 	return span
 }

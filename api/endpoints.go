@@ -11,7 +11,6 @@ import (
 
 	"github.com/go-kit/kit/endpoint"
 	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/tracing/opentracing"
 	"github.com/microservices-demo/user/db"
 	"github.com/microservices-demo/user/users"
 	stdopentracing "github.com/opentracing/opentracing-go"
@@ -36,6 +35,21 @@ type Endpoints struct {
 // MakeEndpoints returns an Endpoints structure, where each endpoint is
 // backed by the given service.
 func MakeEndpoints(s Service, tracer stdopentracing.Tracer, logger log.Logger) Endpoints {
+	traceServer := func(operationName string) endpoint.Middleware {
+		return func(next endpoint.Endpoint) endpoint.Endpoint {
+			return func(ctx context.Context, request interface{}) (interface{}, error) {
+				var span stdopentracing.Span
+				if parentSpan := stdopentracing.SpanFromContext(ctx); parentSpan != nil {
+					span = tracer.StartSpan(operationName, ext.RPCServerOption(parentSpan.Context()))
+				} else {
+					span = tracer.StartSpan(operationName, ext.SpanKindRPCServer)
+				}
+				defer span.Finish()
+				return next(stdopentracing.ContextWithSpan(ctx, span), request)
+			}
+		}
+	}
+
 	// Create logging middleware that extracts trace info
 	loggingMiddleware := func(method string) endpoint.Middleware {
 		return func(next endpoint.Endpoint) endpoint.Endpoint {
@@ -47,9 +61,7 @@ func MakeEndpoints(s Service, tracer stdopentracing.Tracer, logger log.Logger) E
 				traceid := ""
 				spanid := ""
 				if span != nil {
-					// Set span kind to SERVER for HTTP entry points
-					ext.SpanKindRPCServer.Set(span)
-					span.SetTag("span.kind", "server")
+					// span.kind is set at span creation by traceServer; in Zipkin it is represented as span Kind.
 					if sc, ok := span.Context().(zipkinot.SpanContext); ok {
 						// Format trace ID - use Low part for 64-bit trace IDs
 						traceid = fmt.Sprintf("%x", sc.TraceID.Low)
@@ -88,16 +100,16 @@ func MakeEndpoints(s Service, tracer stdopentracing.Tracer, logger log.Logger) E
 	}
 
 	return Endpoints{
-		LoginEndpoint:       opentracing.TraceServer(tracer, "GET /login")(loggingMiddleware("Login")(MakeLoginEndpoint(s))),
-		RegisterEndpoint:    opentracing.TraceServer(tracer, "POST /register")(loggingMiddleware("Register")(MakeRegisterEndpoint(s))),
+		LoginEndpoint:       traceServer("GET /login")(loggingMiddleware("Login")(MakeLoginEndpoint(s))),
+		RegisterEndpoint:    traceServer("POST /register")(loggingMiddleware("Register")(MakeRegisterEndpoint(s))),
 		HealthEndpoint:      MakeHealthEndpoint(s), // No tracing for health checks
-		UserGetEndpoint:     opentracing.TraceServer(tracer, "GET /customers")(loggingMiddleware("GetUsers")(MakeUserGetEndpoint(s))),
-		UserPostEndpoint:    opentracing.TraceServer(tracer, "POST /customers")(loggingMiddleware("PostUser")(MakeUserPostEndpoint(s))),
-		AddressGetEndpoint:  opentracing.TraceServer(tracer, "GET /addresses")(loggingMiddleware("GetAddresses")(MakeAddressGetEndpoint(s))),
-		AddressPostEndpoint: opentracing.TraceServer(tracer, "POST /addresses")(loggingMiddleware("PostAddress")(MakeAddressPostEndpoint(s))),
-		CardGetEndpoint:     opentracing.TraceServer(tracer, "GET /cards")(loggingMiddleware("GetCards")(MakeCardGetEndpoint(s))),
-		DeleteEndpoint:      opentracing.TraceServer(tracer, "DELETE /")(loggingMiddleware("Delete")(MakeDeleteEndpoint(s))),
-		CardPostEndpoint:    opentracing.TraceServer(tracer, "POST /cards")(loggingMiddleware("PostCard")(MakeCardPostEndpoint(s))),
+		UserGetEndpoint:     traceServer("GET /customers")(loggingMiddleware("GetUsers")(MakeUserGetEndpoint(s))),
+		UserPostEndpoint:    traceServer("POST /customers")(loggingMiddleware("PostUser")(MakeUserPostEndpoint(s))),
+		AddressGetEndpoint:  traceServer("GET /addresses")(loggingMiddleware("GetAddresses")(MakeAddressGetEndpoint(s))),
+		AddressPostEndpoint: traceServer("POST /addresses")(loggingMiddleware("PostAddress")(MakeAddressPostEndpoint(s))),
+		CardGetEndpoint:     traceServer("GET /cards")(loggingMiddleware("GetCards")(MakeCardGetEndpoint(s))),
+		DeleteEndpoint:      traceServer("DELETE /")(loggingMiddleware("Delete")(MakeDeleteEndpoint(s))),
+		CardPostEndpoint:    traceServer("POST /cards")(loggingMiddleware("PostCard")(MakeCardPostEndpoint(s))),
 	}
 }
 
