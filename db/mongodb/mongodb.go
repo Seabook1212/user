@@ -30,16 +30,6 @@ var (
 
 const defaultMongoPeerService = "user-db"
 
-// Package-level context for tracing - set by the db package
-var traceContext context.Context = context.Background()
-
-// SetTraceContext sets the context for tracing MongoDB operations
-func SetTraceContext(ctx context.Context) {
-	if ctx != nil {
-		traceContext = ctx
-	}
-}
-
 // setMongoDBSpanTags sets common tags for MongoDB spans (called after span creation)
 func setMongoDBSpanTags(span stdopentracing.Span, collection string) {
 	// Database-related tags
@@ -100,21 +90,40 @@ func resolvePeerServiceName(rawHost string) string {
 	return peer
 }
 
-// startMongoDBSpan creates a new span with CLIENT kind for MongoDB operations
-func startMongoDBSpan(name string) stdopentracing.Span {
+// startMongoDBSpan creates a new span with CLIENT kind for MongoDB operations.
+func startMongoDBSpan(ctx context.Context, name string) stdopentracing.Span {
 	startOpts := []stdopentracing.StartSpanOption{
 		ext.SpanKindRPCClient,
 		stdopentracing.Tag{Key: string(ext.PeerService), Value: resolvePeerServiceName(host)},
 	}
 
 	var span stdopentracing.Span
-	if parentSpan := stdopentracing.SpanFromContext(traceContext); parentSpan != nil {
+	if parentSpan := stdopentracing.SpanFromContext(ctx); parentSpan != nil {
 		startOpts = append(startOpts, stdopentracing.ChildOf(parentSpan.Context()))
 		span = stdopentracing.StartSpan(name, startOpts...)
 	} else {
 		span = stdopentracing.GlobalTracer().StartSpan(name, startOpts...)
 	}
 	return span
+}
+
+func recordSpanError(span stdopentracing.Span, err error) {
+	if err == nil {
+		return
+	}
+	span.SetTag("error", true)
+	span.SetTag("error.type", fmt.Sprintf("%T", err))
+	span.SetTag("error.message", err.Error())
+}
+
+func mongoOpError(op, collection string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if collection == "" {
+		return fmt.Errorf("mongodb op=%s: %w", op, err)
+	}
+	return fmt.Errorf("mongodb op=%s collection=%s: %w", op, collection, err)
 }
 
 func init() {
@@ -132,12 +141,17 @@ type Mongo struct {
 // Init MongoDB
 func (m *Mongo) Init() error {
 	u := getURL()
+	const dialTimeout = 5 * time.Second
+
 	var err error
-	m.Session, err = mgo.DialWithTimeout(u.String(), time.Duration(5)*time.Second)
+	m.Session, err = mgo.DialWithTimeout(u.String(), dialTimeout)
 	if err != nil {
-		return err
+		return fmt.Errorf("mongodb dial host=%s timeout=%s: %w", host, dialTimeout, err)
 	}
-	return m.EnsureIndexes()
+	if err := m.EnsureIndexes(); err != nil {
+		return fmt.Errorf("mongodb init host=%s: %w", host, err)
+	}
+	return nil
 }
 
 // MongoUser is a wrapper for the users
@@ -200,10 +214,9 @@ func (m *MongoCard) AddID() {
 }
 
 // CreateUser Insert user to MongoDB, including connected addresses and cards, update passed in user with Ids
-func (m *Mongo) CreateUser(u *users.User) error {
-	span := startMongoDBSpan("mongodb: create user")
+func (m *Mongo) CreateUser(ctx context.Context, u *users.User) error {
+	span := startMongoDBSpan(ctx, "mongodb: create user")
 	setMongoDBSpanTags(span, "customers")
-	span.SetTag("username", u.Username)
 	defer span.Finish()
 
 	s := m.Session.Copy()
@@ -214,41 +227,41 @@ func (m *Mongo) CreateUser(u *users.User) error {
 	mu.ID = id
 	var carderr error
 	var addrerr error
-	mu.CardIDs, carderr = m.createCards(u.Cards)
-	mu.AddressIDs, addrerr = m.createAddresses(u.Addresses)
+	mu.CardIDs, carderr = m.createCards(ctx, u.Cards)
+	mu.AddressIDs, addrerr = m.createAddresses(ctx, u.Addresses)
 	c := s.DB("").C("customers")
 	_, err := c.UpsertId(mu.ID, mu)
 	if err != nil {
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		wrappedErr := mongoOpError("create_user", "customers", err)
+		recordSpanError(span, wrappedErr)
 		// Gonna clean up if we can, ignore error
 		// because the user save error takes precedence.
-		m.cleanAttributes(mu)
-		return err
+		if cleanupErr := m.cleanAttributes(ctx, mu); cleanupErr != nil {
+			return errors.Join(wrappedErr, cleanupErr)
+		}
+		return wrappedErr
 	}
 	mu.User.UserID = mu.ID.Hex()
-	// Cheap err for attributes
 	if carderr != nil || addrerr != nil {
-		span.SetTag("error", true)
-		span.SetTag("error.message", fmt.Sprintf("%v %v", carderr, addrerr))
-		return fmt.Errorf("%v %v", carderr, addrerr)
+		joinedErr := errors.Join(carderr, addrerr)
+		recordSpanError(span, joinedErr)
+		return joinedErr
 	}
 	*u = mu.User
 	return nil
 }
 
-func (m *Mongo) createCards(cs []users.Card) ([]bson.ObjectId, error) {
+func (m *Mongo) createCards(_ context.Context, cs []users.Card) ([]bson.ObjectId, error) {
 	s := m.Session.Copy()
 	defer s.Close()
 	ids := make([]bson.ObjectId, 0)
-	defer s.Close()
 	for k, ca := range cs {
 		id := bson.NewObjectId()
 		mc := MongoCard{Card: ca, ID: id}
 		c := s.DB("").C("cards")
 		_, err := c.UpsertId(mc.ID, mc)
 		if err != nil {
-			return ids, err
+			return ids, mongoOpError("create_card_attribute", "cards", err)
 		}
 		ids = append(ids, id)
 		cs[k].ID = id.Hex()
@@ -256,7 +269,7 @@ func (m *Mongo) createCards(cs []users.Card) ([]bson.ObjectId, error) {
 	return ids, nil
 }
 
-func (m *Mongo) createAddresses(as []users.Address) ([]bson.ObjectId, error) {
+func (m *Mongo) createAddresses(_ context.Context, as []users.Address) ([]bson.ObjectId, error) {
 	ids := make([]bson.ObjectId, 0)
 	s := m.Session.Copy()
 	defer s.Close()
@@ -266,7 +279,7 @@ func (m *Mongo) createAddresses(as []users.Address) ([]bson.ObjectId, error) {
 		c := s.DB("").C("addresses")
 		_, err := c.UpsertId(ma.ID, ma)
 		if err != nil {
-			return ids, err
+			return ids, mongoOpError("create_address_attribute", "addresses", err)
 		}
 		ids = append(ids, id)
 		as[k].ID = id.Hex()
@@ -274,37 +287,43 @@ func (m *Mongo) createAddresses(as []users.Address) ([]bson.ObjectId, error) {
 	return ids, nil
 }
 
-func (m *Mongo) cleanAttributes(mu MongoUser) error {
+func (m *Mongo) cleanAttributes(_ context.Context, mu MongoUser) error {
 	s := m.Session.Copy()
 	defer s.Close()
 	c := s.DB("").C("addresses")
 	_, err := c.RemoveAll(bson.M{"_id": bson.M{"$in": mu.AddressIDs}})
+	if err != nil {
+		return mongoOpError("cleanup_addresses", "addresses", err)
+	}
 	c = s.DB("").C("cards")
 	_, err = c.RemoveAll(bson.M{"_id": bson.M{"$in": mu.CardIDs}})
-	return err
+	return mongoOpError("cleanup_cards", "cards", err)
 }
 
-func (m *Mongo) appendAttributeId(attr string, id bson.ObjectId, userid string) error {
+func (m *Mongo) appendAttributeId(_ context.Context, attr string, id bson.ObjectId, userid string) error {
 	s := m.Session.Copy()
 	defer s.Close()
 	c := s.DB("").C("customers")
-	return c.Update(bson.M{"_id": bson.ObjectIdHex(userid)},
-		bson.M{"$addToSet": bson.M{attr: id}})
+	return mongoOpError("append_attribute_id", "customers", c.Update(
+		bson.M{"_id": bson.ObjectIdHex(userid)},
+		bson.M{"$addToSet": bson.M{attr: id}},
+	))
 }
 
-func (m *Mongo) removeAttributeId(attr string, id bson.ObjectId, userid string) error {
+func (m *Mongo) removeAttributeId(_ context.Context, attr string, id bson.ObjectId, userid string) error {
 	s := m.Session.Copy()
 	defer s.Close()
 	c := s.DB("").C("customers")
-	return c.Update(bson.M{"_id": bson.ObjectIdHex(userid)},
-		bson.M{"$pull": bson.M{attr: id}})
+	return mongoOpError("remove_attribute_id", "customers", c.Update(
+		bson.M{"_id": bson.ObjectIdHex(userid)},
+		bson.M{"$pull": bson.M{attr: id}},
+	))
 }
 
 // GetUserByName Get user by their name
-func (m *Mongo) GetUserByName(name string) (users.User, error) {
-	span := startMongoDBSpan("mongodb: find user by name")
+func (m *Mongo) GetUserByName(ctx context.Context, name string) (users.User, error) {
+	span := startMongoDBSpan(ctx, "mongodb: find user by name")
 	setMongoDBSpanTags(span, "customers")
-	span.SetTag("username", name)
 	defer span.Finish()
 
 	s := m.Session.Copy()
@@ -313,16 +332,16 @@ func (m *Mongo) GetUserByName(name string) (users.User, error) {
 	mu := New()
 	err := c.Find(bson.M{"username": name}).One(&mu)
 	if err != nil {
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err = mongoOpError("find_user_by_name", "customers", err)
+		recordSpanError(span, err)
 	}
 	mu.AddUserIDs()
 	return mu.User, err
 }
 
 // GetUser Get user by their object id
-func (m *Mongo) GetUser(id string) (users.User, error) {
-	span := startMongoDBSpan("mongodb: find user by id")
+func (m *Mongo) GetUser(ctx context.Context, id string) (users.User, error) {
+	span := startMongoDBSpan(ctx, "mongodb: find user by id")
 	setMongoDBSpanTags(span, "customers")
 	span.SetTag("user.id", id)
 	defer span.Finish()
@@ -330,25 +349,24 @@ func (m *Mongo) GetUser(id string) (users.User, error) {
 	s := m.Session.Copy()
 	defer s.Close()
 	if !bson.IsObjectIdHex(id) {
-		err := errors.New("Invalid Id Hex")
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err := fmt.Errorf("mongodb get_user id=%s: %w", id, ErrInvalidHexID)
+		recordSpanError(span, err)
 		return users.New(), err
 	}
 	c := s.DB("").C("customers")
 	mu := New()
 	err := c.FindId(bson.ObjectIdHex(id)).One(&mu)
 	if err != nil {
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err = mongoOpError("find_user_by_id", "customers", err)
+		recordSpanError(span, err)
 	}
 	mu.AddUserIDs()
 	return mu.User, err
 }
 
 // GetUsers Get all users
-func (m *Mongo) GetUsers() ([]users.User, error) {
-	span := startMongoDBSpan("mongodb: find all users")
+func (m *Mongo) GetUsers(ctx context.Context) ([]users.User, error) {
+	span := startMongoDBSpan(ctx, "mongodb: find all users")
 	setMongoDBSpanTags(span, "customers")
 	defer span.Finish()
 
@@ -359,8 +377,8 @@ func (m *Mongo) GetUsers() ([]users.User, error) {
 	var mus []MongoUser
 	err := c.Find(nil).All(&mus)
 	if err != nil {
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err = mongoOpError("find_all_users", "customers", err)
+		recordSpanError(span, err)
 	} else {
 		span.SetTag("result.count", len(mus))
 	}
@@ -373,21 +391,21 @@ func (m *Mongo) GetUsers() ([]users.User, error) {
 }
 
 // GetUserAttributes given a user, load all cards and addresses connected to that user
-func (m *Mongo) GetUserAttributes(u *users.User) error {
+func (m *Mongo) GetUserAttributes(ctx context.Context, u *users.User) error {
 	s := m.Session.Copy()
 	defer s.Close()
 
 	// Fetch addresses - directly connect to HTTP request span
-	addrSpan := startMongoDBSpan("mongodb: find addresses")
+	addrSpan := startMongoDBSpan(ctx, "mongodb: find addresses")
 	setMongoDBSpanTags(addrSpan, "addresses")
 	addrSpan.SetTag("user.id", u.UserID)
 	ids := make([]bson.ObjectId, 0)
 	for _, a := range u.Addresses {
 		if !bson.IsObjectIdHex(a.ID) {
-			addrSpan.SetTag("error", true)
-			addrSpan.SetTag("error.message", ErrInvalidHexID.Error())
+			err := fmt.Errorf("mongodb get_user_attributes address_id=%s: %w", a.ID, ErrInvalidHexID)
+			recordSpanError(addrSpan, err)
 			addrSpan.Finish()
-			return ErrInvalidHexID
+			return err
 		}
 		ids = append(ids, bson.ObjectIdHex(a.ID))
 	}
@@ -395,8 +413,8 @@ func (m *Mongo) GetUserAttributes(u *users.User) error {
 	c := s.DB("").C("addresses")
 	err := c.Find(bson.M{"_id": bson.M{"$in": ids}}).All(&ma)
 	if err != nil {
-		addrSpan.SetTag("error", true)
-		addrSpan.SetTag("error.message", err.Error())
+		err = mongoOpError("find_user_addresses", "addresses", err)
+		recordSpanError(addrSpan, err)
 		addrSpan.Finish()
 		return err
 	}
@@ -411,16 +429,16 @@ func (m *Mongo) GetUserAttributes(u *users.User) error {
 	u.Addresses = na
 
 	// Fetch cards - directly connect to HTTP request span
-	cardSpan := startMongoDBSpan("mongodb: find cards")
+	cardSpan := startMongoDBSpan(ctx, "mongodb: find cards")
 	setMongoDBSpanTags(cardSpan, "cards")
 	cardSpan.SetTag("user.id", u.UserID)
 	ids = make([]bson.ObjectId, 0)
 	for _, c := range u.Cards {
 		if !bson.IsObjectIdHex(c.ID) {
-			cardSpan.SetTag("error", true)
-			cardSpan.SetTag("error.message", ErrInvalidHexID.Error())
+			err := fmt.Errorf("mongodb get_user_attributes card_id=%s: %w", c.ID, ErrInvalidHexID)
+			recordSpanError(cardSpan, err)
 			cardSpan.Finish()
-			return ErrInvalidHexID
+			return err
 		}
 		ids = append(ids, bson.ObjectIdHex(c.ID))
 	}
@@ -428,8 +446,8 @@ func (m *Mongo) GetUserAttributes(u *users.User) error {
 	c = s.DB("").C("cards")
 	err = c.Find(bson.M{"_id": bson.M{"$in": ids}}).All(&mc)
 	if err != nil {
-		cardSpan.SetTag("error", true)
-		cardSpan.SetTag("error.message", err.Error())
+		err = mongoOpError("find_user_cards", "cards", err)
+		recordSpanError(cardSpan, err)
 		cardSpan.Finish()
 		return err
 	}
@@ -446,8 +464,8 @@ func (m *Mongo) GetUserAttributes(u *users.User) error {
 }
 
 // GetCard Gets card by objects Id
-func (m *Mongo) GetCard(id string) (users.Card, error) {
-	span := startMongoDBSpan("mongodb: find card by id")
+func (m *Mongo) GetCard(ctx context.Context, id string) (users.Card, error) {
+	span := startMongoDBSpan(ctx, "mongodb: find card by id")
 	setMongoDBSpanTags(span, "cards")
 	span.SetTag("card.id", id)
 	defer span.Finish()
@@ -455,25 +473,24 @@ func (m *Mongo) GetCard(id string) (users.Card, error) {
 	s := m.Session.Copy()
 	defer s.Close()
 	if !bson.IsObjectIdHex(id) {
-		err := errors.New("Invalid Id Hex")
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err := fmt.Errorf("mongodb get_card id=%s: %w", id, ErrInvalidHexID)
+		recordSpanError(span, err)
 		return users.Card{}, err
 	}
 	c := s.DB("").C("cards")
 	mc := MongoCard{}
 	err := c.FindId(bson.ObjectIdHex(id)).One(&mc)
 	if err != nil {
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err = mongoOpError("find_card_by_id", "cards", err)
+		recordSpanError(span, err)
 	}
 	mc.AddID()
 	return mc.Card, err
 }
 
 // GetCards Gets all cards
-func (m *Mongo) GetCards() ([]users.Card, error) {
-	span := startMongoDBSpan("mongodb: find all cards")
+func (m *Mongo) GetCards(ctx context.Context) ([]users.Card, error) {
+	span := startMongoDBSpan(ctx, "mongodb: find all cards")
 	setMongoDBSpanTags(span, "cards")
 	defer span.Finish()
 
@@ -484,8 +501,8 @@ func (m *Mongo) GetCards() ([]users.Card, error) {
 	var mcs []MongoCard
 	err := c.Find(nil).All(&mcs)
 	if err != nil {
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err = mongoOpError("find_all_cards", "cards", err)
+		recordSpanError(span, err)
 	} else {
 		span.SetTag("result.count", len(mcs))
 	}
@@ -498,16 +515,15 @@ func (m *Mongo) GetCards() ([]users.Card, error) {
 }
 
 // CreateCard adds card to MongoDB
-func (m *Mongo) CreateCard(ca *users.Card, userid string) error {
-	span := startMongoDBSpan("mongodb: create card")
+func (m *Mongo) CreateCard(ctx context.Context, ca *users.Card, userid string) error {
+	span := startMongoDBSpan(ctx, "mongodb: create card")
 	setMongoDBSpanTags(span, "cards")
 	span.SetTag("user.id", userid)
 	defer span.Finish()
 
 	if userid != "" && !bson.IsObjectIdHex(userid) {
-		err := errors.New("Invalid Id Hex")
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err := fmt.Errorf("mongodb create_card user_id=%s: %w", userid, ErrInvalidHexID)
+		recordSpanError(span, err)
 		return err
 	}
 	s := m.Session.Copy()
@@ -517,16 +533,15 @@ func (m *Mongo) CreateCard(ca *users.Card, userid string) error {
 	mc := MongoCard{Card: *ca, ID: id}
 	_, err := c.UpsertId(mc.ID, mc)
 	if err != nil {
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err = mongoOpError("create_card", "cards", err)
+		recordSpanError(span, err)
 		return err
 	}
 	// Address for anonymous user
 	if userid != "" {
-		err = m.appendAttributeId("cards", mc.ID, userid)
+		err = m.appendAttributeId(ctx, "cards", mc.ID, userid)
 		if err != nil {
-			span.SetTag("error", true)
-			span.SetTag("error.message", err.Error())
+			recordSpanError(span, err)
 			return err
 		}
 	}
@@ -536,8 +551,8 @@ func (m *Mongo) CreateCard(ca *users.Card, userid string) error {
 }
 
 // GetAddress Gets an address by object Id
-func (m *Mongo) GetAddress(id string) (users.Address, error) {
-	span := startMongoDBSpan("mongodb: find address by id")
+func (m *Mongo) GetAddress(ctx context.Context, id string) (users.Address, error) {
+	span := startMongoDBSpan(ctx, "mongodb: find address by id")
 	setMongoDBSpanTags(span, "addresses")
 	span.SetTag("address.id", id)
 	defer span.Finish()
@@ -545,25 +560,24 @@ func (m *Mongo) GetAddress(id string) (users.Address, error) {
 	s := m.Session.Copy()
 	defer s.Close()
 	if !bson.IsObjectIdHex(id) {
-		err := errors.New("Invalid Id Hex")
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err := fmt.Errorf("mongodb get_address id=%s: %w", id, ErrInvalidHexID)
+		recordSpanError(span, err)
 		return users.Address{}, err
 	}
 	c := s.DB("").C("addresses")
 	ma := MongoAddress{}
 	err := c.FindId(bson.ObjectIdHex(id)).One(&ma)
 	if err != nil {
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err = mongoOpError("find_address_by_id", "addresses", err)
+		recordSpanError(span, err)
 	}
 	ma.AddID()
 	return ma.Address, err
 }
 
 // GetAddresses gets all addresses
-func (m *Mongo) GetAddresses() ([]users.Address, error) {
-	span := startMongoDBSpan("mongodb: find all addresses")
+func (m *Mongo) GetAddresses(ctx context.Context) ([]users.Address, error) {
+	span := startMongoDBSpan(ctx, "mongodb: find all addresses")
 	setMongoDBSpanTags(span, "addresses")
 	defer span.Finish()
 
@@ -574,8 +588,8 @@ func (m *Mongo) GetAddresses() ([]users.Address, error) {
 	var mas []MongoAddress
 	err := c.Find(nil).All(&mas)
 	if err != nil {
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err = mongoOpError("find_all_addresses", "addresses", err)
+		recordSpanError(span, err)
 	} else {
 		span.SetTag("result.count", len(mas))
 	}
@@ -588,16 +602,15 @@ func (m *Mongo) GetAddresses() ([]users.Address, error) {
 }
 
 // CreateAddress Inserts Address into MongoDB
-func (m *Mongo) CreateAddress(a *users.Address, userid string) error {
-	span := startMongoDBSpan("mongodb: create address")
+func (m *Mongo) CreateAddress(ctx context.Context, a *users.Address, userid string) error {
+	span := startMongoDBSpan(ctx, "mongodb: create address")
 	setMongoDBSpanTags(span, "addresses")
 	span.SetTag("user.id", userid)
 	defer span.Finish()
 
 	if userid != "" && !bson.IsObjectIdHex(userid) {
-		err := errors.New("Invalid Id Hex")
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err := fmt.Errorf("mongodb create_address user_id=%s: %w", userid, ErrInvalidHexID)
+		recordSpanError(span, err)
 		return err
 	}
 	s := m.Session.Copy()
@@ -607,16 +620,15 @@ func (m *Mongo) CreateAddress(a *users.Address, userid string) error {
 	ma := MongoAddress{Address: *a, ID: id}
 	_, err := c.UpsertId(ma.ID, ma)
 	if err != nil {
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err = mongoOpError("create_address", "addresses", err)
+		recordSpanError(span, err)
 		return err
 	}
 	// Address for anonymous user
 	if userid != "" {
-		err = m.appendAttributeId("addresses", ma.ID, userid)
+		err = m.appendAttributeId(ctx, "addresses", ma.ID, userid)
 		if err != nil {
-			span.SetTag("error", true)
-			span.SetTag("error.message", err.Error())
+			recordSpanError(span, err)
 			return err
 		}
 	}
@@ -626,26 +638,24 @@ func (m *Mongo) CreateAddress(a *users.Address, userid string) error {
 }
 
 // Delete removes an entity from MongoDB
-func (m *Mongo) Delete(entity, id string) error {
-	span := startMongoDBSpan("mongodb: delete entity")
+func (m *Mongo) Delete(ctx context.Context, entity, id string) error {
+	span := startMongoDBSpan(ctx, "mongodb: delete entity")
 	setMongoDBSpanTags(span, entity)
 	span.SetTag("entity.id", id)
 	defer span.Finish()
 
 	if !bson.IsObjectIdHex(id) {
-		err := errors.New("Invalid Id Hex")
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err := fmt.Errorf("mongodb delete entity=%s id=%s: %w", entity, id, ErrInvalidHexID)
+		recordSpanError(span, err)
 		return err
 	}
 	s := m.Session.Copy()
 	defer s.Close()
 	c := s.DB("").C(entity)
 	if entity == "customers" {
-		u, err := m.GetUser(id)
+		u, err := m.GetUser(ctx, id)
 		if err != nil {
-			span.SetTag("error", true)
-			span.SetTag("error.message", err.Error())
+			recordSpanError(span, err)
 			return err
 		}
 		aids := make([]bson.ObjectId, 0)
@@ -657,18 +667,32 @@ func (m *Mongo) Delete(entity, id string) error {
 			cids = append(cids, bson.ObjectIdHex(c.ID))
 		}
 		ac := s.DB("").C("addresses")
-		ac.RemoveAll(bson.M{"_id": bson.M{"$in": aids}})
+		if _, err := ac.RemoveAll(bson.M{"_id": bson.M{"$in": aids}}); err != nil {
+			err = mongoOpError("delete_customer_addresses", "addresses", err)
+			recordSpanError(span, err)
+			return err
+		}
 		cc := s.DB("").C("cards")
-		cc.RemoveAll(bson.M{"_id": bson.M{"$in": cids}})
+		if _, err := cc.RemoveAll(bson.M{"_id": bson.M{"$in": cids}}); err != nil {
+			err = mongoOpError("delete_customer_cards", "cards", err)
+			recordSpanError(span, err)
+			return err
+		}
 	} else {
 		c := s.DB("").C("customers")
-		c.UpdateAll(bson.M{},
-			bson.M{"$pull": bson.M{entity: bson.ObjectIdHex(id)}})
+		if _, err := c.UpdateAll(
+			bson.M{},
+			bson.M{"$pull": bson.M{entity: bson.ObjectIdHex(id)}},
+		); err != nil {
+			err = mongoOpError("remove_customer_reference", "customers", err)
+			recordSpanError(span, err)
+			return err
+		}
 	}
 	err := c.Remove(bson.M{"_id": bson.ObjectIdHex(id)})
 	if err != nil {
-		span.SetTag("error", true)
-		span.SetTag("error.message", err.Error())
+		err = mongoOpError("delete_entity", entity, err)
+		recordSpanError(span, err)
 	}
 	return err
 }
@@ -698,11 +722,14 @@ func (m *Mongo) EnsureIndexes() error {
 		Sparse:     false,
 	}
 	c := s.DB("").C("customers")
-	return c.EnsureIndex(i)
+	if err := c.EnsureIndex(i); err != nil {
+		return mongoOpError("ensure_index", "customers", err)
+	}
+	return nil
 }
 
-func (m *Mongo) Ping() error {
+func (m *Mongo) Ping(context.Context) error {
 	s := m.Session.Copy()
 	defer s.Close()
-	return s.Ping()
+	return mongoOpError("ping", "users", s.Ping())
 }

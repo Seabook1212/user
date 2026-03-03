@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -62,21 +63,21 @@ func TestRegister(t *testing.T) {
 }
 
 func TestCreateUser(t *testing.T) {
-	err := CreateUser(&users.User{})
+	err := CreateUser(context.Background(), &users.User{})
 	if err != ErrFakeError {
 		t.Error("expected fake db error from create")
 	}
 }
 
 func TestGetUser(t *testing.T) {
-	_, err := GetUser("test")
+	_, err := GetUser(context.Background(), "test")
 	if err != ErrFakeError {
 		t.Error("expected fake db error from get")
 	}
 }
 
 func TestGetUserByName(t *testing.T) {
-	_, err := GetUserByName("test")
+	_, err := GetUserByName(context.Background(), "test")
 	if err != ErrFakeError {
 		t.Error("expected fake db error from get")
 	}
@@ -84,7 +85,7 @@ func TestGetUserByName(t *testing.T) {
 
 func TestGetUserAttributes(t *testing.T) {
 	u := users.New()
-	GetUserAttributes(&u)
+	GetUserAttributes(context.Background(), &u)
 	if len(u.Addresses) != 1 {
 		t.Error("expected one address added for GetUserAttributes")
 	}
@@ -94,7 +95,7 @@ func TestGetUserAttributes(t *testing.T) {
 }
 
 func TestPing(t *testing.T) {
-	err := Ping()
+	err := Ping(context.Background())
 	if err != ErrFakeError {
 		t.Error("expected fake db error from ping")
 	}
@@ -106,54 +107,54 @@ type fake struct{}
 func (f fake) Init() error {
 	return ErrFakeError
 }
-func (f fake) GetUserByName(name string) (users.User, error) {
+func (f fake) GetUserByName(context.Context, string) (users.User, error) {
 	return users.User{}, ErrFakeError
 }
-func (f fake) GetUser(id string) (users.User, error) {
+func (f fake) GetUser(context.Context, string) (users.User, error) {
 	return users.User{}, ErrFakeError
 }
 
-func (f fake) GetUsers() ([]users.User, error) {
+func (f fake) GetUsers(context.Context) ([]users.User, error) {
 	return make([]users.User, 0), ErrFakeError
 }
 
-func (f fake) CreateUser(*users.User) error {
+func (f fake) CreateUser(context.Context, *users.User) error {
 	return ErrFakeError
 }
 
-func (f fake) GetUserAttributes(u *users.User) error {
+func (f fake) GetUserAttributes(_ context.Context, u *users.User) error {
 	u.Addresses = append(u.Addresses, TestAddress)
 	return nil
 }
 
-func (f fake) GetCard(id string) (users.Card, error) {
+func (f fake) GetCard(context.Context, string) (users.Card, error) {
 	return users.Card{}, ErrFakeError
 }
 
-func (f fake) GetCards() ([]users.Card, error) {
+func (f fake) GetCards(context.Context) ([]users.Card, error) {
 	return make([]users.Card, 0), ErrFakeError
 }
 
-func (f fake) CreateCard(c *users.Card, id string) error {
+func (f fake) CreateCard(context.Context, *users.Card, string) error {
 	return ErrFakeError
 }
 
-func (f fake) GetAddress(id string) (users.Address, error) {
+func (f fake) GetAddress(context.Context, string) (users.Address, error) {
 	return users.Address{}, ErrFakeError
 }
 
-func (f fake) GetAddresses() ([]users.Address, error) {
+func (f fake) GetAddresses(context.Context) ([]users.Address, error) {
 	return make([]users.Address, 0), ErrFakeError
 }
 
-func (f fake) CreateAddress(u *users.Address, id string) error {
+func (f fake) CreateAddress(context.Context, *users.Address, string) error {
 	return ErrFakeError
 }
 
-func (f fake) Delete(entity, id string) error {
+func (f fake) Delete(context.Context, string, string) error {
 	return ErrFakeError
 }
 
-func (f fake) Ping() error {
+func (f fake) Ping(context.Context) error {
 	return ErrFakeError
 }

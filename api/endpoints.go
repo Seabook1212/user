@@ -7,6 +7,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"time"
 
 	"github.com/go-kit/kit/endpoint"
@@ -15,7 +16,6 @@ import (
 	"github.com/microservices-demo/user/users"
 	stdopentracing "github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
-	zipkinot "github.com/openzipkin-contrib/zipkin-go-opentracing"
 )
 
 // Endpoints collects the endpoints that comprise the Service.
@@ -37,15 +37,62 @@ type Endpoints struct {
 func MakeEndpoints(s Service, tracer stdopentracing.Tracer, logger log.Logger) Endpoints {
 	traceServer := func(operationName string) endpoint.Middleware {
 		return func(next endpoint.Endpoint) endpoint.Endpoint {
-			return func(ctx context.Context, request interface{}) (interface{}, error) {
+			return func(ctx context.Context, request interface{}) (response interface{}, err error) {
 				var span stdopentracing.Span
-				if parentSpan := stdopentracing.SpanFromContext(ctx); parentSpan != nil {
+				if incomingSpanContext := getIncomingSpanContext(ctx); incomingSpanContext != nil {
+					span = tracer.StartSpan(operationName, ext.RPCServerOption(incomingSpanContext))
+				} else if parentSpan := stdopentracing.SpanFromContext(ctx); parentSpan != nil {
 					span = tracer.StartSpan(operationName, ext.RPCServerOption(parentSpan.Context()))
 				} else {
 					span = tracer.StartSpan(operationName, ext.SpanKindRPCServer)
 				}
-				defer span.Finish()
-				return next(stdopentracing.ContextWithSpan(ctx, span), request)
+				if requestMethod := getRequestMethodContext(ctx); requestMethod != "" {
+					span.SetTag("http.method", requestMethod)
+					ext.HTTPMethod.Set(span, requestMethod)
+				}
+				if requestURI := getRequestURIContext(ctx); requestURI != "" {
+					span.SetTag("http.url", requestURI)
+					ext.HTTPUrl.Set(span, requestURI)
+				}
+				ctx = stdopentracing.ContextWithSpan(ctx, span)
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						if state, _ := ctx.Value(requestLogStateKey{}).(*requestLogState); state != nil {
+							state.endpointFailureLogged = true
+						}
+						stack := debug.Stack()
+						traceID, spanID := traceFieldsFromContext(ctx)
+						span.SetTag("error", true)
+						span.SetTag("exception.type", fmt.Sprintf("%T", recovered))
+						span.SetTag("exception.message", fmt.Sprint(recovered))
+						span.SetTag("stack", string(stack))
+						logger.Log(
+							"level", "error",
+							"service", "user",
+							"component", "http",
+							"operation", operationName,
+							"traceid", traceID,
+							"spanid", spanID,
+							"http_method", getRequestMethodContext(ctx),
+							"route", getRequestURIContext(ctx),
+							"status_code", httpStatusCodeFromError(err),
+							"panic", recovered,
+							"stack", string(stack),
+						)
+						err = fmt.Errorf("panic in %s: %v", operationName, recovered)
+					}
+					statusCode := httpStatusCodeFromError(err)
+					span.SetTag("http.status_code", statusCode)
+					ext.HTTPStatusCode.Set(span, uint16(statusCode))
+					if err != nil {
+						span.SetTag("error", true)
+						span.SetTag("error.type", classifyError(err))
+						span.SetTag("error.message", err.Error())
+					}
+					span.Finish()
+				}()
+				response, err = next(ctx, request)
+				return response, err
 			}
 		}
 	}
@@ -56,28 +103,26 @@ func MakeEndpoints(s Service, tracer stdopentracing.Tracer, logger log.Logger) E
 			return func(ctx context.Context, request interface{}) (interface{}, error) {
 				begin := time.Now()
 
-				// Extract trace information from context and set span kind BEFORE processing
-				span := stdopentracing.SpanFromContext(ctx)
-				traceid := ""
-				spanid := ""
-				if span != nil {
-					// span.kind is set at span creation by traceServer; in Zipkin it is represented as span Kind.
-					if sc, ok := span.Context().(zipkinot.SpanContext); ok {
-						// Format trace ID - use Low part for 64-bit trace IDs
-						traceid = fmt.Sprintf("%x", sc.TraceID.Low)
-						// Format span ID - this is the server span ID created by TraceServer
-						spanid = fmt.Sprintf("%x", uint64(sc.ID))
-					}
-				}
+				traceid, spanid := traceFieldsFromContext(ctx)
 
 				// Process the request
 				response, err := next(ctx, request)
+				if err != nil {
+					if state, _ := ctx.Value(requestLogStateKey{}).(*requestLogState); state != nil {
+						state.endpointFailureLogged = true
+					}
+				}
 
 				// Build log message
 				logArgs := []interface{}{
+					"service", "user",
+					"component", "http",
 					"traceid", traceid,
 					"spanid", spanid,
-					"method", method,
+					"operation", method,
+					"http_method", getRequestMethodContext(ctx),
+					"route", getRequestURIContext(ctx),
+					"status_code", httpStatusCodeFromError(err),
 				}
 
 				// Add request-specific fields based on method
@@ -85,13 +130,17 @@ func MakeEndpoints(s Service, tracer stdopentracing.Tracer, logger log.Logger) E
 
 				// Add error if present
 				if err != nil {
-					logArgs = append(logArgs, "err", err.Error())
+					logArgs = append(logArgs,
+						"level", "error",
+						"error_type", classifyError(err),
+						"err", err.Error(),
+					)
 				} else {
-					logArgs = append(logArgs, "err", "null")
+					logArgs = append(logArgs, "level", "info")
 				}
 
 				// Add duration
-				logArgs = append(logArgs, "took", fmt.Sprintf("%v", time.Since(begin)))
+				logArgs = append(logArgs, "latency_ms", time.Since(begin).Milliseconds())
 
 				logger.Log(logArgs...)
 				return response, err
@@ -185,9 +234,8 @@ func appendRequestFields(logArgs []interface{}, method string, request interface
 // MakeLoginEndpoint returns an endpoint via the given service.
 func MakeLoginEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		db.SetTraceContext(ctx)
 		req := request.(loginRequest)
-		u, err := s.Login(req.Username, req.Password)
+		u, err := s.Login(ctx, req.Username, req.Password)
 		return userResponse{User: u}, err
 	}
 }
@@ -195,9 +243,8 @@ func MakeLoginEndpoint(s Service) endpoint.Endpoint {
 // MakeRegisterEndpoint returns an endpoint via the given service.
 func MakeRegisterEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		db.SetTraceContext(ctx)
 		req := request.(registerRequest)
-		id, err := s.Register(req.Username, req.Password, req.Email, req.FirstName, req.LastName)
+		id, err := s.Register(ctx, req.Username, req.Password, req.Email, req.FirstName, req.LastName)
 		return postResponse{ID: id}, err
 	}
 }
@@ -205,10 +252,9 @@ func MakeRegisterEndpoint(s Service) endpoint.Endpoint {
 // MakeUserGetEndpoint returns an endpoint via the given service.
 func MakeUserGetEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		db.SetTraceContext(ctx)
 		req := request.(GetRequest)
 
-		usrs, err := s.GetUsers(req.ID)
+		usrs, err := s.GetUsers(ctx, req.ID)
 		if req.ID == "" {
 			return EmbedStruct{usersResponse{Users: usrs}}, err
 		}
@@ -222,7 +268,9 @@ func MakeUserGetEndpoint(s Service) endpoint.Endpoint {
 			return users.User{}, err
 		}
 		user := usrs[0]
-		db.GetUserAttributes(&user)
+		if err := db.GetUserAttributes(ctx, &user); err != nil {
+			return users.User{}, fmt.Errorf("get users load attributes id=%s: %w", req.ID, err)
+		}
 		if req.Attr == "addresses" {
 			return EmbedStruct{addressesResponse{Addresses: user.Addresses}}, err
 		}
@@ -236,9 +284,8 @@ func MakeUserGetEndpoint(s Service) endpoint.Endpoint {
 // MakeUserPostEndpoint returns an endpoint via the given service.
 func MakeUserPostEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		db.SetTraceContext(ctx)
 		req := request.(users.User)
-		id, err := s.PostUser(req)
+		id, err := s.PostUser(ctx, req)
 		return postResponse{ID: id}, err
 	}
 }
@@ -246,9 +293,8 @@ func MakeUserPostEndpoint(s Service) endpoint.Endpoint {
 // MakeAddressGetEndpoint returns an endpoint via the given service.
 func MakeAddressGetEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		db.SetTraceContext(ctx)
 		req := request.(GetRequest)
-		adds, err := s.GetAddresses(req.ID)
+		adds, err := s.GetAddresses(ctx, req.ID)
 		if req.ID == "" {
 			return EmbedStruct{addressesResponse{Addresses: adds}}, err
 		}
@@ -262,9 +308,8 @@ func MakeAddressGetEndpoint(s Service) endpoint.Endpoint {
 // MakeAddressPostEndpoint returns an endpoint via the given service.
 func MakeAddressPostEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		db.SetTraceContext(ctx)
 		req := request.(addressPostRequest)
-		id, err := s.PostAddress(req.Address, req.UserID)
+		id, err := s.PostAddress(ctx, req.Address, req.UserID)
 		return postResponse{ID: id}, err
 	}
 }
@@ -272,9 +317,8 @@ func MakeAddressPostEndpoint(s Service) endpoint.Endpoint {
 // MakeCardGetEndpoint returns an endpoint via the given service.
 func MakeCardGetEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		db.SetTraceContext(ctx)
 		req := request.(GetRequest)
-		cards, err := s.GetCards(req.ID)
+		cards, err := s.GetCards(ctx, req.ID)
 		if req.ID == "" {
 			return EmbedStruct{cardsResponse{Cards: cards}}, err
 		}
@@ -288,9 +332,8 @@ func MakeCardGetEndpoint(s Service) endpoint.Endpoint {
 // MakeCardPostEndpoint returns an endpoint via the given service.
 func MakeCardPostEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		db.SetTraceContext(ctx)
 		req := request.(cardPostRequest)
-		id, err := s.PostCard(req.Card, req.UserID)
+		id, err := s.PostCard(ctx, req.Card, req.UserID)
 		return postResponse{ID: id}, err
 	}
 }
@@ -298,9 +341,8 @@ func MakeCardPostEndpoint(s Service) endpoint.Endpoint {
 // MakeDeleteEndpoint returns an endpoint via the given service.
 func MakeDeleteEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		db.SetTraceContext(ctx)
 		req := request.(deleteRequest)
-		err = s.Delete(req.Entity, req.ID)
+		err = s.Delete(ctx, req.Entity, req.ID)
 		if err == nil {
 			return statusResponse{Status: true}, err
 		}
@@ -311,7 +353,7 @@ func MakeDeleteEndpoint(s Service) endpoint.Endpoint {
 // MakeHealthEndpoint returns current health of the given service.
 func MakeHealthEndpoint(s Service) endpoint.Endpoint {
 	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
-		health := s.Health()
+		health := s.Health(ctx)
 		return healthResponse{Health: health}, nil
 	}
 }

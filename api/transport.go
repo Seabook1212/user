@@ -11,32 +11,103 @@ import (
 	"strings"
 
 	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/tracing/opentracing"
 	httptransport "github.com/go-kit/kit/transport/http"
 	"github.com/gorilla/mux"
+	"github.com/microservices-demo/user/db/mongodb"
 	"github.com/microservices-demo/user/users"
 	stdopentracing "github.com/opentracing/opentracing-go"
+	zipkinot "github.com/openzipkin-contrib/zipkin-go-opentracing"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"gopkg.in/mgo.v2"
 )
 
 var (
 	ErrInvalidRequest = errors.New("Invalid request")
 )
 
+type incomingSpanContextKey struct{}
+type requestURIContextKey struct{}
+type requestMethodContextKey struct{}
+
+func setIncomingSpanContext(ctx context.Context, sc stdopentracing.SpanContext) context.Context {
+	if sc == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, incomingSpanContextKey{}, sc)
+}
+
+func getIncomingSpanContext(ctx context.Context) stdopentracing.SpanContext {
+	sc, _ := ctx.Value(incomingSpanContextKey{}).(stdopentracing.SpanContext)
+	return sc
+}
+
+func setRequestURIContext(ctx context.Context, requestURI string) context.Context {
+	if strings.TrimSpace(requestURI) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, requestURIContextKey{}, requestURI)
+}
+
+func getRequestURIContext(ctx context.Context) string {
+	uri, _ := ctx.Value(requestURIContextKey{}).(string)
+	return uri
+}
+
+func setRequestMethodContext(ctx context.Context, method string) context.Context {
+	if strings.TrimSpace(method) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, requestMethodContextKey{}, method)
+}
+
+func getRequestMethodContext(ctx context.Context) string {
+	method, _ := ctx.Value(requestMethodContextKey{}).(string)
+	return method
+}
+
+func hasValidIncomingSpanContext(sc stdopentracing.SpanContext) bool {
+	if sc == nil {
+		return false
+	}
+	// zipkin-go-opentracing can return a zero-value span context when no B3 trace
+	// headers are present; treat that as "not found".
+	if zsc, ok := sc.(zipkinot.SpanContext); ok {
+		return !zsc.TraceID.Empty() && zsc.ID > 0
+	}
+	return true
+}
+
 // MakeHTTPHandler mounts the endpoints into a REST-y HTTP handler.
 func MakeHTTPHandler(e Endpoints, logger log.Logger, tracer stdopentracing.Tracer) *mux.Router {
 	r := mux.NewRouter().StrictSlash(false)
+	r.Use(RecoverMiddleware(logger, tracer))
 	options := []httptransport.ServerOption{
-		httptransport.ServerErrorLogger(logger),
-		httptransport.ServerErrorEncoder(encodeError),
-		// Add HTTPToContext globally to all endpoints for trace propagation
-		httptransport.ServerBefore(opentracing.HTTPToContext(tracer, "http-request", logger)),
+		httptransport.ServerErrorEncoder(makeErrorEncoder(logger)),
+		httptransport.ServerBefore(func(ctx context.Context, req *http.Request) context.Context {
+			ctx = setRequestURIContext(ctx, req.URL.RequestURI())
+			ctx = setRequestMethodContext(ctx, req.Method)
+			ctx = context.WithValue(ctx, requestLogStateKey{}, &requestLogState{})
+
+			wireContext, err := tracer.Extract(
+				stdopentracing.HTTPHeaders,
+				stdopentracing.HTTPHeadersCarrier(req.Header),
+			)
+			if err != nil {
+				if err != stdopentracing.ErrSpanContextNotFound {
+					logTransportFailure(logger, ctx, err, "operation", "extract_trace_context")
+				}
+				return ctx
+			}
+			if !hasValidIncomingSpanContext(wireContext) {
+				return ctx
+			}
+			return setIncomingSpanContext(ctx, wireContext)
+		}),
 	}
 
 	// Options for health/metrics endpoints without tracing
 	healthOptions := []httptransport.ServerOption{
-		httptransport.ServerErrorLogger(logger),
-		httptransport.ServerErrorEncoder(encodeError),
+		httptransport.ServerErrorEncoder(makeErrorEncoder(logger)),
 	}
 
 	// GET /login       Login
@@ -107,19 +178,52 @@ func MakeHTTPHandler(e Endpoints, logger log.Logger, tracer stdopentracing.Trace
 	return r
 }
 
-func encodeError(_ context.Context, err error, w http.ResponseWriter) {
-	code := http.StatusInternalServerError
-	switch err {
-	case ErrUnauthorized:
-		code = http.StatusUnauthorized
+func makeErrorEncoder(logger log.Logger) httptransport.ErrorEncoder {
+	return func(ctx context.Context, err error, w http.ResponseWriter) {
+		if state, _ := ctx.Value(requestLogStateKey{}).(*requestLogState); state == nil || !state.endpointFailureLogged {
+			logTransportFailure(logger, ctx, err, "operation", "transport")
+		}
+
+		code := httpStatusCodeFromError(err)
+		w.Header().Set("Content-Type", "application/hal+json")
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":       publicErrorMessage(err),
+			"status_code": code,
+			"status_text": http.StatusText(code),
+		})
 	}
-	w.WriteHeader(code)
+}
+
+func encodeError(_ context.Context, err error, w http.ResponseWriter) {
+	code := httpStatusCodeFromError(err)
 	w.Header().Set("Content-Type", "application/hal+json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"error":       err.Error(),
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error":       publicErrorMessage(err),
 		"status_code": code,
 		"status_text": http.StatusText(code),
 	})
+}
+
+func httpStatusCodeFromError(err error) int {
+	if err == nil {
+		return http.StatusOK
+	}
+	switch {
+	case errors.Is(err, ErrUnauthorized):
+		return http.StatusUnauthorized
+	case errors.Is(err, ErrInvalidRequest), errors.Is(err, mongodb.ErrInvalidHexID):
+		return http.StatusBadRequest
+	case errors.Is(err, mgo.ErrNotFound):
+		return http.StatusNotFound
+	case classifyError(err) == "duplicate_key":
+		return http.StatusConflict
+	case errors.Is(err, context.DeadlineExceeded):
+		return http.StatusGatewayTimeout
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 func decodeLoginRequest(_ context.Context, r *http.Request) (interface{}, error) {
@@ -135,10 +239,11 @@ func decodeLoginRequest(_ context.Context, r *http.Request) (interface{}, error)
 }
 
 func decodeRegisterRequest(_ context.Context, r *http.Request) (interface{}, error) {
+	defer r.Body.Close()
 	reg := registerRequest{}
 	err := json.NewDecoder(r.Body).Decode(&reg)
 	if err != nil {
-		return nil, err
+		return nil, newBadRequestError(err)
 	}
 	return reg, nil
 }
@@ -151,7 +256,7 @@ func decodeDeleteRequest(_ context.Context, r *http.Request) (interface{}, error
 		d.ID = u[2]
 		return d, nil
 	}
-	return d, ErrInvalidRequest
+	return d, newBadRequestError(nil)
 }
 
 func decodeGetRequest(_ context.Context, r *http.Request) (interface{}, error) {
@@ -171,7 +276,7 @@ func decodeUserRequest(_ context.Context, r *http.Request) (interface{}, error) 
 	u := users.User{}
 	err := json.NewDecoder(r.Body).Decode(&u)
 	if err != nil {
-		return nil, err
+		return nil, newBadRequestError(err)
 	}
 	return u, nil
 }
@@ -181,7 +286,7 @@ func decodeAddressRequest(_ context.Context, r *http.Request) (interface{}, erro
 	a := addressPostRequest{}
 	err := json.NewDecoder(r.Body).Decode(&a)
 	if err != nil {
-		return nil, err
+		return nil, newBadRequestError(err)
 	}
 	return a, nil
 }
@@ -191,7 +296,7 @@ func decodeCardRequest(_ context.Context, r *http.Request) (interface{}, error) 
 	c := cardPostRequest{}
 	err := json.NewDecoder(r.Body).Decode(&c)
 	if err != nil {
-		return nil, err
+		return nil, newBadRequestError(err)
 	}
 	return c, nil
 }
@@ -208,4 +313,13 @@ func encodeResponse(_ context.Context, w http.ResponseWriter, response interface
 	// All of our response objects are JSON serializable, so we just do that.
 	w.Header().Set("Content-Type", "application/hal+json")
 	return json.NewEncoder(w).Encode(response)
+}
+
+func publicErrorMessage(err error) string {
+	switch httpStatusCodeFromError(err) {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusNotFound, http.StatusConflict:
+		return err.Error()
+	default:
+		return http.StatusText(http.StatusInternalServerError)
+	}
 }

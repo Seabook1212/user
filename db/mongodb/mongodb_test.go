@@ -1,8 +1,10 @@
 package mongodb
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/microservices-demo/user/users"
@@ -45,7 +47,7 @@ func exitTest(i int) {
 
 func TestInit(t *testing.T) {
 	err := TestMongo.Init()
-	if err.Error() != "no reachable servers" {
+	if err == nil || !strings.Contains(err.Error(), "no reachable servers") {
 		t.Error("expecting no reachable servers error")
 	}
 }
@@ -105,11 +107,11 @@ func TestCardAddId(t *testing.T) {
 func TestCreate(t *testing.T) {
 	TestMongo.Session = TestServer.Session()
 	defer TestMongo.Session.Close()
-	err := TestMongo.CreateUser(&TestUser)
+	err := TestMongo.CreateUser(context.Background(), &TestUser)
 	if err != nil {
 		t.Error(err)
 	}
-	err = TestMongo.CreateUser(&TestUser)
+	err = TestMongo.CreateUser(context.Background(), &TestUser)
 	if err == nil {
 		t.Error("Expected duplicate key error")
 	}
@@ -118,14 +120,14 @@ func TestCreate(t *testing.T) {
 func TestGetUserByName(t *testing.T) {
 	TestMongo.Session = TestServer.Session()
 	defer TestMongo.Session.Close()
-	u, err := TestMongo.GetUserByName(TestUser.Username)
+	u, err := TestMongo.GetUserByName(context.Background(), TestUser.Username)
 	if err != nil {
 		t.Error(err)
 	}
 	if u.Username != TestUser.Username {
 		t.Error("expected equal usernames")
 	}
-	_, err = TestMongo.GetUserByName("bogususers")
+	_, err = TestMongo.GetUserByName(context.Background(), "bogususers")
 	if err == nil {
 		t.Error("expected not found error")
 	}
@@ -134,7 +136,7 @@ func TestGetUserByName(t *testing.T) {
 func TestGetUser(t *testing.T) {
 	TestMongo.Session = TestServer.Session()
 	defer TestMongo.Session.Close()
-	_, err := TestMongo.GetUser(TestUser.UserID)
+	_, err := TestMongo.GetUser(context.Background(), TestUser.UserID)
 	if err != nil {
 		t.Error(err)
 	}
@@ -158,7 +160,7 @@ func TestGetURL(t *testing.T) {
 func TestPing(t *testing.T) {
 	TestMongo.Session = TestServer.Session()
 	defer TestMongo.Session.Close()
-	err := TestMongo.Ping()
+	err := TestMongo.Ping(context.Background())
 	if err != nil {
 		t.Error(err)
 	}

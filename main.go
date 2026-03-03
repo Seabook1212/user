@@ -32,6 +32,13 @@ var (
 	zip  string
 )
 
+var kubernetesTraceTagEnvVars = map[string]string{
+	"container": "CONTAINER_NAME",
+	"pod":       "POD_NAME",
+	"namespace": "POD_NAMESPACE",
+	"node":      "NODE_NAME",
+}
+
 var (
 	HTTPLatency = stdprometheus.NewHistogramVec(stdprometheus.HistogramOpts{
 		Name:    "http_request_duration_seconds",
@@ -58,7 +65,10 @@ var (
 )
 
 const (
-	ServiceName = "user"
+	ServiceName          = "user"
+	defaultZipkinHost    = "jaeger-collector.observability.svc.cluster.local"
+	defaultZipkinPort    = "9411"
+	defaultZipkinBaseURL = "http://jaeger-collector.observability.svc.cluster.local:9411"
 )
 
 func init() {
@@ -85,6 +95,19 @@ func main() {
 		logger = log.With(logger, "caller", log.DefaultCaller)
 	}
 
+	zipkinAddr, zipkinSource := resolveZipkinEndpoint()
+	logger.Log(
+		"msg", "Tracing configuration resolved",
+		"zipkin_addr", zipkinAddr,
+		"zipkin_source", zipkinSource,
+		"zipkin_flag", strings.TrimSpace(zip),
+		"zipkin_env", strings.TrimSpace(os.Getenv("ZIPKIN")),
+		"zipkin_host_env", strings.TrimSpace(os.Getenv("ZIPKIN_HOST")),
+		"zipkin_port_env", strings.TrimSpace(os.Getenv("ZIPKIN_PORT")),
+		"zipkin_base_url_env", strings.TrimSpace(os.Getenv("ZIPKIN_BASE_URL")),
+		"args", strings.Join(os.Args[1:], " "),
+	)
+
 	// Find service local IP.
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
@@ -98,19 +121,22 @@ func main() {
 	var tracer stdopentracing.Tracer
 	var zipkinReporter reporter.Reporter
 	{
-		if zip == "" {
+		if zipkinAddr == "" {
 			tracer = stdopentracing.NoopTracer{}
-			logger.Log("msg", "Tracing disabled - no Zipkin endpoint configured")
+			logger.Log(
+				"msg", "Tracing disabled - no Zipkin endpoint configured",
+				"checked_envs", "ZIPKIN,JAEGER_COLLECTOR_URL,JAEGER_ENDPOINT",
+			)
 		} else {
 			logger := log.With(logger, "tracer", "Zipkin")
-			logger.Log("addr", zip)
+			logger.Log("addr", zipkinAddr, "source", zipkinSource)
 
 			// Create a standard logger for Zipkin reporter errors
 			zipkinLogger := corelog.New(os.Stderr, "ZIPKIN: ", corelog.LstdFlags)
 
 			// Create reporter with batching for better performance
 			zipkinReporter = zipkinhttp.NewReporter(
-				zip,
+				zipkinAddr,
 				zipkinhttp.BatchSize(100),
 				zipkinhttp.BatchInterval(1*time.Second),
 				zipkinhttp.Logger(zipkinLogger),
@@ -122,11 +148,17 @@ func main() {
 				os.Exit(1)
 			}
 
-			nativeTracer, err := zipkin.NewTracer(
-				zipkinReporter,
+			tracerOptions := []zipkin.TracerOption{
 				zipkin.WithLocalEndpoint(endpoint),
-				zipkin.WithSharedSpans(true),
-			)
+				// Create dedicated server span IDs instead of reusing caller span IDs.
+				zipkin.WithSharedSpans(false),
+			}
+			if kubernetesTraceTags := getKubernetesTraceTags(); len(kubernetesTraceTags) > 0 {
+				logger.Log("msg", "Zipkin default tags enabled", "tags", fmt.Sprintf("%v", kubernetesTraceTags))
+				tracerOptions = append(tracerOptions, zipkin.WithTags(kubernetesTraceTags))
+			}
+
+			nativeTracer, err := zipkin.NewTracer(zipkinReporter, tracerOptions...)
 			if err != nil {
 				logger.Log("err", err)
 				os.Exit(1)
@@ -144,17 +176,39 @@ func main() {
 			zipkinReporter.Close()
 		}
 	}()
-	dbconn := false
-	for !dbconn {
+	const dbRetryBackoff = 1 * time.Second
+	for attempt := 1; ; attempt++ {
 		err := db.Init()
 		if err != nil {
 			if err == db.ErrNoDatabaseSelected {
-				corelog.Fatal(err)
+				logger.Log(
+					"level", "error",
+					"service", ServiceName,
+					"component", "startup",
+					"dependency", "mongodb",
+					"operation", "init",
+					"retry_attempt", attempt,
+					"error_type", "configuration",
+					"err", err,
+				)
+				os.Exit(1)
 			}
-			corelog.Print(err)
-		} else {
-			dbconn = true
+			logger.Log(
+				"level", "error",
+				"service", ServiceName,
+				"component", "startup",
+				"dependency", "mongodb",
+				"target", strings.TrimSpace(os.Getenv("MONGO_HOST")),
+				"operation", "init",
+				"retry_attempt", attempt,
+				"retry_in", dbRetryBackoff.String(),
+				"error_type", api.ClassifyError(err),
+				"err", err,
+			)
+			time.Sleep(dbRetryBackoff)
+			continue
 		}
+		break
 	}
 
 	fieldKeys := []string{"method"}
@@ -203,9 +257,25 @@ func main() {
 	handler := commonMiddleware.Merge(httpMiddleware...).Wrap(router)
 
 	// Create and launch the HTTP server.
+	server := &http.Server{
+		Addr:              fmt.Sprintf(":%v", port),
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
 	go func() {
-		logger.Log("transport", "HTTP", "port", port)
-		errc <- http.ListenAndServe(fmt.Sprintf(":%v", port), handler)
+		logger.Log(
+			"transport", "HTTP",
+			"port", port,
+			"read_header_timeout", server.ReadHeaderTimeout.String(),
+			"read_timeout", server.ReadTimeout.String(),
+			"write_timeout", server.WriteTimeout.String(),
+			"idle_timeout", server.IdleTimeout.String(),
+		)
+		errc <- server.ListenAndServe()
 	}()
 
 	// Capture interrupts.
@@ -215,5 +285,65 @@ func main() {
 		errc <- fmt.Errorf("%s", <-c)
 	}()
 
-	logger.Log("exit", <-errc)
+	if err := <-errc; err != nil {
+		logger.Log("level", "error", "service", ServiceName, "component", "runtime", "exit", err)
+	}
+}
+
+func getKubernetesTraceTags() map[string]string {
+	tags := make(map[string]string, len(kubernetesTraceTagEnvVars))
+
+	for tagName, envVarName := range kubernetesTraceTagEnvVars {
+		if value := strings.TrimSpace(os.Getenv(envVarName)); value != "" {
+			tags[tagName] = value
+		}
+	}
+
+	return tags
+}
+
+func resolveZipkinEndpoint() (string, string) {
+	if value := strings.TrimSpace(zip); value != "" {
+		return normalizeZipkinCollectorURL(value), "flag(-zipkin)"
+	}
+	if value := strings.TrimSpace(os.Getenv("ZIPKIN")); value != "" {
+		return normalizeZipkinCollectorURL(value), "env(ZIPKIN)"
+	}
+	if value := strings.TrimSpace(os.Getenv("JAEGER_COLLECTOR_URL")); value != "" {
+		return normalizeZipkinCollectorURL(value), "env(JAEGER_COLLECTOR_URL)"
+	}
+	if value := strings.TrimSpace(os.Getenv("JAEGER_ENDPOINT")); value != "" {
+		return normalizeZipkinCollectorURL(value), "env(JAEGER_ENDPOINT)"
+	}
+
+	zipkinBaseURL := strings.TrimSpace(os.Getenv("ZIPKIN_BASE_URL"))
+	if zipkinBaseURL != "" {
+		return normalizeZipkinCollectorURL(zipkinBaseURL), "env(ZIPKIN_BASE_URL)"
+	}
+
+	zipkinHost := strings.TrimSpace(os.Getenv("ZIPKIN_HOST"))
+	if zipkinHost == "" {
+		zipkinHost = defaultZipkinHost
+	}
+	zipkinPort := strings.TrimSpace(os.Getenv("ZIPKIN_PORT"))
+	if zipkinPort == "" {
+		zipkinPort = defaultZipkinPort
+	}
+
+	if zipkinHost != "" && zipkinPort != "" {
+		return normalizeZipkinCollectorURL(fmt.Sprintf("http://%s:%s", zipkinHost, zipkinPort)), "env(ZIPKIN_HOST/ZIPKIN_PORT)"
+	}
+
+	return normalizeZipkinCollectorURL(defaultZipkinBaseURL), "default(ZIPKIN_BASE_URL)"
+}
+
+func normalizeZipkinCollectorURL(value string) string {
+	url := strings.TrimSpace(value)
+	if url == "" {
+		return ""
+	}
+	if strings.HasSuffix(strings.ToLower(url), "/api/v2/spans") {
+		return url
+	}
+	return strings.TrimRight(url, "/") + "/api/v2/spans"
 }
