@@ -1,112 +1,168 @@
 # User Service
-[![Build Status](https://travis-ci.org/microservices-demo/user.svg?branch=master)](https://travis-ci.org/microservices-demo/user)
-[![Coverage Status](https://coveralls.io/repos/github/microservices-demo/user/badge.svg?branch=master)](https://coveralls.io/github/microservices-demo/user?branch=master)
-[![Go Report Card](https://goreportcard.com/badge/github.com/microservices-demo/user)](https://goreportcard.com/report/github.com/microservices-demo/user)
-[![](https://images.microbadger.com/badges/image/weaveworksdemos/user.svg)](http://microbadger.com/images/weaveworksdemos/user "Get your own image badge on microbadger.com")
 
-This service covers user account storage, to include cards and addresses
+This repository contains the enhanced Sock Shop `user` service used by the
+EviRCA benchmark:
 
-## Bugs, Feature Requests and Contributing
-We'd love to see community contributions. We like to keep it simple and use Github issues to track bugs and feature requests and pull requests to manage contributions.
+> EviRCA: An Evidence-Aware Skill-Based LLM Agent and a Telemetry-Rich
+> Multi-Modal Benchmark for Microservice Root Cause Analysis
 
->## API Spec
+The service stores and serves Sock Shop customer accounts, addresses, and
+payment cards. It is a Go 1.22 modernization of the original Sock Shop user
+service, with additional observability and robustness changes for reproducible
+microservice root cause analysis (RCA) experiments.
 
-Checkout the API Spec [here](http://microservices-demo.github.io/api/index?url=https://raw.githubusercontent.com/microservices-demo/user/master/apispec/user.json)
+## Role in the EviRCA Benchmark
 
->## Build
+EviRCA builds a telemetry-rich benchmark on an enhanced Sock Shop deployment.
+This service is one of the Go services in that system, alongside services such
+as `catalogue` and `payment`. In the benchmark, `user` contributes telemetry for
+account-related request paths and MongoDB-backed dependency behavior.
 
-### Using Go natively
+The benchmark uses synchronized metrics, logs, traces, service topology, Chaos
+Mesh fault-injection artifacts, upgraded service implementations, and
+fine-grained labels to evaluate RCA at service, pod, service-fault, and
+pod-fault granularities.
+
+## What This Service Does
+
+- Provides REST endpoints for customer, address, card, login, register, delete,
+  health, and Prometheus metrics operations.
+- Persists customer, address, and card data in MongoDB.
+- Emits Prometheus HTTP metrics, including request latency, request count,
+  in-flight requests, request size, and response size.
+- Propagates and emits OpenTracing/Zipkin-compatible spans for HTTP requests
+  and MongoDB operations.
+- Adds Kubernetes metadata to trace spans when `CONTAINER_NAME`, `POD_NAME`,
+  `POD_NAMESPACE`, and `NODE_NAME` are available.
+- Emits trace-aware structured logs with operation names, trace IDs, span IDs,
+  HTTP status codes, latency, result summaries, and classified errors.
+- Includes dependency initialization retry behavior, HTTP timeouts, structured
+  error responses, and panic recovery instrumentation.
+
+## API
+
+The service exposes the original Sock Shop user API surface:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/health` | Health check |
+| `GET` | `/metrics` | Prometheus metrics |
+| `GET` | `/login` | Login with HTTP Basic Auth |
+| `POST` | `/register` | Register a customer |
+| `GET` | `/customers` or `/customers/{id}` | List or fetch customers |
+| `POST` | `/customers` | Create a customer |
+| `GET` | `/addresses` or `/addresses/{id}` | List or fetch addresses |
+| `POST` | `/addresses` | Create an address |
+| `GET` | `/cards` or `/cards/{id}` | List or fetch cards |
+| `POST` | `/cards` | Create a card |
+| `DELETE` | `/{entity}/{id}` | Delete a customer, address, or card |
+
+The OpenAPI specification is in `apispec/user.json`.
+
+## Configuration
+
+Common runtime options and environment variables:
+
+| Name | Description | Default |
+| --- | --- | --- |
+| `-port` | HTTP listen port | `8084` for native runs, `80` or `8080` in container images |
+| `-mongo-host` / `MONGO_HOST` | MongoDB host | empty natively, `user-db` in Docker images |
+| `-mongo-user` / `MONGO_USER` | MongoDB username | empty |
+| `-mongo-password` / `MONGO_PASS` | MongoDB password | empty |
+| `-zipkin` / `ZIPKIN` | Zipkin collector URL | resolved from tracing environment |
+| `ZIPKIN_BASE_URL` | Zipkin base URL before `/api/v2/spans` is appended | empty |
+| `ZIPKIN_HOST` / `ZIPKIN_PORT` | Zipkin host and port | `jaeger-collector.observability.svc.cluster.local:9411` |
+| `JAEGER_COLLECTOR_URL` / `JAEGER_ENDPOINT` | Jaeger/Zipkin-compatible collector URL | empty |
+
+The tracing URL resolver normalizes collector URLs to the Zipkin v2 endpoint
+ending in `/api/v2/spans`.
+
+## Build
+
+### Native Go
 
 ```bash
-make build
+go mod download
+go build -o bin/user main.go
 ```
 
-### Using Docker Compose
+### Docker
 
 ```bash
-docker-compose build
+make dockerlocal
 ```
 
->## Test
+## Test
+
+Run the full test suite in the test container:
 
 ```bash
 make test
 ```
 
->## Run
+Run native coverage tests:
 
-### Natively
+```bash
+make cover
+```
+
+## Run
+
+### Docker Compose
+
+```bash
+docker-compose up --build
+```
+
+The compose file starts both `user` and `user-db`. The service is published on
+`http://localhost:8080`.
+
+### Native
+
+Start MongoDB first, then run the service:
+
 ```bash
 docker-compose up -d user-db
-./bin/user -port=8080 -database=mongodb -mongo-host=localhost:27017
+go run . -port=8084 -mongo-host=localhost:27017
 ```
 
-### Using Docker Compose
-```bash
-docker-compose up
-```
-
->## Check
+Check the service:
 
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:8084/health
+curl http://localhost:8084/metrics
 ```
 
->## Use
-
-Test user account passwords can be found in the comments in `users-db-test/scripts/customer-insert.js`
-
-### Customers
+## Example Requests
 
 ```bash
-curl http://localhost:8080/customers
+curl http://localhost:8084/customers
+curl http://localhost:8084/addresses
+curl http://localhost:8084/cards
+curl -u user:password http://localhost:8084/login
 ```
 
-### Cards
-```bash
-curl http://localhost:8080/cards
-```
+Seed test users and example credentials are defined in
+`docker/user-db/scripts/customer-insert.js`.
 
-### Addresses
+## Zipkin / Trace Collection
 
-```bash
-curl http://localhost:8080/addresses
-```
-
-### Login
-```bash
-curl http://localhost:8080/login
-```
-
-### Register
+For a local Zipkin-style trace collection test:
 
 ```bash
-curl http://localhost:8080/register
-```
-
-## Push
-
-```bash
-make dockertravisbuild
-```
-
-## Test Zipkin
-
-To test with Zipkin
-
-```
-make
 docker-compose -f docker-compose-zipkin.yml build
 docker-compose -f docker-compose-zipkin.yml up
 ```
-It takes about 10 seconds to seed data
 
-you should see it at:
-[http://localhost:9411/](http://localhost:9411)
+After the service and seed data are ready, open:
 
-be sure to hit the "Find Traces" button.  You may need to reload the page.
-
-when done you can run:
+```text
+http://localhost:9411/
 ```
+
+Then run a few requests against the user API and search for traces in Zipkin.
+Stop the stack with:
+
+```bash
 docker-compose -f docker-compose-zipkin.yml down
 ```
